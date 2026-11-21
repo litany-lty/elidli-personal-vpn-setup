@@ -101,6 +101,104 @@ def check_x_priority_logic() -> None:
     assert other["rules"] == [f"DOMAIN-SUFFIX,{site},Japan exit" for site in sites] + ordinary["rules"]
 
 
+def check_single_exit_logic(directory: Path) -> None:
+    """Prove a named direct node cannot carry unrelated providers into a new profile."""
+    module_spec = importlib.util.spec_from_file_location(
+        "elidli_single_exit", SCRIPTS / "client_config.py"
+    )
+    assert module_spec and module_spec.loader
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+
+    own_name = "My dedicated Japan exit"
+    third_party_marker = "THIRD-PARTY-SENTINEL"
+    source_url = "https://subscription.invalid/PRIVATE-SOURCE-SENTINEL"
+    source = {
+        "proxies": [
+            {"name": own_name, "type": "ss", "server": "192.0.2.10", "port": 28447,
+             "cipher": "aes-128-gcm", "password": "OWN-SYNTHETIC-SECRET", "udp": True},
+            {"name": "unrelated subscription node", "type": "ss", "server": "192.0.2.20",
+             "port": 28448, "cipher": "aes-128-gcm", "password": third_party_marker,
+             "udp": True},
+            {"name": "front", "type": "ss", "server": "192.0.2.30", "port": 28449,
+             "cipher": "aes-128-gcm", "password": "FRONT-SENTINEL", "udp": True},
+            {"name": "chained", "type": "ss", "server": "192.0.2.10", "port": 28447,
+             "cipher": "aes-128-gcm", "password": "OWN-SYNTHETIC-SECRET", "udp": True,
+             "dialer-proxy": "front"},
+        ],
+        "proxy-groups": [
+            {"name": "old selector", "type": "select", "proxies": [own_name, "chained"]},
+            {"name": "old relay", "type": "relay", "proxies": ["front", own_name]},
+        ],
+        "proxy-providers": {"subscription": {"type": "http", "url": source_url}},
+        "rules": ["DOMAIN-SUFFIX,example.cn,old selector", "MATCH,old selector"],
+    }
+
+    state = module.direct_ss_state_from_profile(source, own_name)
+    assert state == {
+        "kind": "ss", "server": "192.0.2.10", "port": 28447,
+        "method": "aes-128-gcm", "password": "OWN-SYNTHETIC-SECRET",
+    }
+    for invalid in ("chained", "old relay", "missing"):
+        try:
+            module.direct_ss_state_from_profile(source, invalid)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"unsafe --only-node selection accepted: {invalid}")
+
+    global_only = module.global_profile(state, "Personal exit")
+    assert global_only["rules"] == ["MATCH,Personal exit"]
+    assert [node["name"] for node in global_only["proxies"]] == ["Personal exit·节点"]
+    rebuilt = module.mainland_split(global_only, "Personal exit", classic=True)
+    module.apply_x_priority(rebuilt, "Personal exit")
+    encoded = json.dumps(rebuilt, ensure_ascii=False)
+    assert [node["name"] for node in rebuilt["proxies"]] == ["Personal exit·节点"]
+    assert rebuilt["proxy-groups"] == [
+        {"name": "Personal exit", "type": "select", "proxies": ["Personal exit·节点"]}
+    ]
+    assert rebuilt["rules"][:4] == [
+        f"DOMAIN-SUFFIX,{domain},Personal exit" for domain in X_DOMAINS
+    ]
+    assert rebuilt["rules"][-2:] == ["GEOIP,CN,DIRECT", "MATCH,Personal exit"]
+    assert all(marker not in encoded for marker in (
+        third_party_marker, "FRONT-SENTINEL", "chained", "old relay", source_url
+    ))
+
+    # The same public loader handles JSON-format profiles without optional dependencies.
+    reference = directory / "synthetic-routing-reference.json"
+    reference.write_text(json.dumps({
+        "proxies": [{"name": "must-not-copy", "password": third_party_marker}],
+        "proxy-providers": {"must-not-copy": {"url": source_url}},
+        "rules": [
+            "DOMAIN-SUFFIX,example.cn,Domestic",
+            "IP-CIDR,203.0.113.0/24,Domestic",
+            "GEOIP,CN,Domestic",
+            "DOMAIN-SUFFIX,overseas.example,Foreign",
+        ],
+    }), encoding="utf-8")
+
+    imported = module.classic_domestic_rules(reference)
+    assert imported == [
+        "DOMAIN-SUFFIX,example.cn,DIRECT", "IP-CIDR,203.0.113.0/24,DIRECT"
+    ]
+
+    if os.name != "nt":
+        base = directory / "old-profile.json"
+        base.write_text(json.dumps(source), encoding="utf-8")
+        output = directory / "only-owned.yaml"
+        command = ("client_config.py", "--mode", "mobile-cn-split", "--base", base,
+                   "--name", "Personal exit", "--classic-android", "--use-x",
+                   "--classic-rules-from", reference, "--output", output, "--only-node")
+        expect_success(run(*command, own_name), "single-exit CLI")
+        written = load_yaml_or_json(output)
+        assert written["proxy-groups"] == rebuilt["proxy-groups"]
+        assert written["proxies"] == rebuilt["proxies"]
+        assert all(rule in written["rules"] for rule in imported)
+        assert "proxy-providers" not in written and source_url not in str(written)
+        assert run(*command, "").returncode != 0
+
+
 def check_catalog_and_cli() -> None:
     catalog = REFERENCES / "providers.csv"
     aliases = REFERENCES / "offer-id-aliases.json"
@@ -242,10 +340,12 @@ def main() -> int:
     check_x_priority_logic()
     with tempfile.TemporaryDirectory(prefix="personal-vpn-smoke-") as temporary:
         directory = Path(temporary)
+        check_single_exit_logic(directory)
         check_order_state(directory)
         client_result = check_client_generation(directory)
     print("PASS: package layout, catalog recommendation, legacy ID and ready order state")
     print("PASS: X intent adds four prioritized, de-duplicated rules and preserves other routes")
+    print("PASS: single-exit generation excludes unrelated nodes, chains and providers")
     print(f"Classic Android and desktop X profiles: {client_result}")
     print("No network, SSH, VPN or system-proxy action was performed.")
     return 0

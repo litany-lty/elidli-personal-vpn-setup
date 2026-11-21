@@ -13,12 +13,14 @@
 如已安装 Git，可在项目根目录直接安装当前发布版本。在本机新建技能目录后，执行：
 
 ```sh
-git clone --depth 1 --branch v1.2.2 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
+git clone --depth 1 --branch v1.3.0 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
 ```
 
 从旧版升级时，将名称为 `personal-vpn-setup` 的旧 Skill 目录移出 Codex 扫描路径，避免出现两个入口。既有服务器服务名和密钥状态目录沿用原有位置。
 
 如果某台设备要用 X（Twitter），直接告诉助手，例如「手机刷 X 图片和视频，电脑只让 X 走日本」。助手会为相应设备自动把 X 和媒体域名放在国内 IP 判断之前。无需手动维护域名清单。对于点名的其他国外服务，也可参考本机已有分流配置，将站点和专属资源域名一起优先匹配；其余流量沿用已有策略。
+
+**只用自己的节点也可以借鉴别人的规则。** 例如「手机国内直连、国外只走自己的日本 VPS。参考 iKuuu 的规则，X 优先」。助手会保留一个自有出口，参考配置仅提供域名分流。若直接从旧手机 YAML 重建，可以用 `--only-node` 指定已确认的自有节点。线路慢时，助手会在这个出口上区分选路等待与视频传输耗时。[单出口示例](references/deployment.md#single-exit-phone)
 
 ## 先试一次
 
@@ -38,7 +40,7 @@ Windows PowerShell 将开头的 `python3` 换成 `py -3 -X utf8`。自检输出 
 | 查价、读报价 ID 和记录订单 | Python 3.10+。macOS、Linux 和 Windows 原生可走此路径。已有服务的发票、账户和真实凭据保存在自己的数据目录。 |
 | 自动部署自己的服务器 | 从 macOS、Linux 或 WSL 调用 OpenSSH。目标是有公网 IPv4、systemd 和发行版软件源的 Debian/Ubuntu VPS。先从商家控制台核对 SSH 主机指纹。root 登录时给检查与部署命令都加 `--remote-root`，普通账号使用免密 `sudo -n`。 |
 | 生成手机和电脑配置 | 在 macOS、Linux 或 WSL 的私有目录生成。Windows 使用 WSL 时把密钥、订单和 YML 放在 WSL 的 Linux 文件系统。新配置只需标准库。读取已有 YAML、继承已有节点或域名规则需要 PyYAML。 |
-| 手机实际使用 | Android 经典 Clash 与 Mihomo 各用对应配置。中国大陆常用方式是国内直连、国外走选定代理。已有链式备用时，经典 Clash 使用 TCP relay，Mihomo 使用 dialer-proxy。设备需要授予系统 VPN 权限并选择规则模式。iOS 和路由器需按具体客户端手动适配。 |
+| 手机实际使用 | Android 经典 Clash 与 Mihomo 各用对应配置。中国大陆常用方式是国内直连、国外走选定代理。明确选择链式备用时，经典 Clash 使用 TCP relay，Mihomo 使用 dialer-proxy。设备需要授予系统 VPN 权限并选择规则模式。iOS 和路由器需按具体客户端手动适配。 |
 | 电脑按站点分流 | 可指定 X 或其他域名，只改变匹配站点的出口。已有桌面配置可生成独立副本，验收时应分别查看目标站点与普通站点的实际连接。 |
 
 需要合并已有 YAML 时，在 macOS、Linux 或 WSL 上用独立 Python 环境安装可选依赖，例如：
@@ -61,5 +63,7 @@ python3 -m venv .venv
 ## English quick start
 
 Download the [release ZIP](https://github.com/litany-lty/elidli-personal-vpn-setup/releases/latest/download/elidli-personal-vpn-setup.zip) and extract it into your project's `.agents/skills/` or your user's `~/.agents/skills/`. The final folder must be `elidli-personal-vpn-setup` with `SKILL.md` directly inside. Invoke `$elidli-personal-vpn-setup` in Codex and describe your devices, budget, monthly traffic and desired exit country in your own language. For example: “My phone should access mainland Chinese sites directly and use Japan for other sites. On my laptop only X should use Japan. Show me a monthly plan first.”
+
+To use only your own VPS, state that constraint per device. A reference profile can inform domain rules without contributing a relay, a fallback node or subscription credentials.
 
 From the extracted folder, run `python3 tests/test_smoke.py` to check the catalog and supported local workflows without credentials. On Windows use `py -3 -X utf8 tests/test_smoke.py`. Python 3.10+ is required. Use macOS, Linux or WSL for private profile generation and SSH deployment to your own Debian/Ubuntu VPS. The provider catalog is a dated snapshot. Pick an offer before checking live prices, pay the provider yourself, and verify your exit and routing on each device.

@@ -71,13 +71,59 @@ def global_profile(state: dict, name: str) -> dict:
     }
 
 
+def direct_ss_state_from_profile(profile: dict, node_name: str) -> dict:
+    """Extract one self-contained Shadowsocks node from parsed profile data."""
+    if not isinstance(profile, dict) or not isinstance(profile.get("proxies"), list):
+        raise SystemExit("the base profile must contain a proxies list")
+    matches = [node for node in profile["proxies"]
+               if isinstance(node, dict) and node.get("name") == node_name]
+    if len(matches) != 1:
+        raise SystemExit("--only-node must identify exactly one proxy node in the base profile")
+    if any(isinstance(group, dict) and group.get("name") == node_name
+           for group in profile.get("proxy-groups", [])):
+        raise SystemExit("--only-node is ambiguous because a proxy group has the same name")
+    node = matches[0]
+    if node.get("type") != "ss":
+        raise SystemExit("--only-node currently supports a direct Shadowsocks node")
+    supported = {"name", "type", "server", "port", "cipher", "password", "udp"}
+    unsupported = set(node) - supported
+    if unsupported:
+        raise SystemExit("the selected node has unsupported dependencies or transport fields: "
+                         + ", ".join(sorted(unsupported)))
+    if (not isinstance(node.get("server"), str) or not node["server"].strip()
+            or type(node.get("port")) is not int or not 1 <= node["port"] <= 65535
+            or any(not isinstance(node.get(key), str) or not node[key] for key in ("cipher", "password"))):
+        raise SystemExit("the selected Shadowsocks node has incomplete server, port, cipher or password fields")
+    if node.get("udp") is not True:
+        raise SystemExit("the selected node must explicitly support UDP for a full-device phone profile")
+    return {
+        "kind": "ss", "server": node["server"], "port": node["port"],
+        "method": node["cipher"], "password": node["password"],
+    }
+
+
+def read_reference_profile(source: Path) -> dict:
+    data = source.read_bytes()
+    if yaml is None:
+        try:
+            profile = json.loads(data)
+        except (ValueError, UnicodeError):
+            raise SystemExit("reading a YAML profile requires PyYAML, or supply JSON-format profile data") from None
+    else:
+        try:
+            profile = yaml.safe_load(data)
+        except yaml.YAMLError:
+            raise SystemExit("the reference profile is not valid YAML") from None
+    if not isinstance(profile, dict):
+        raise SystemExit("the reference profile must be a mapping")
+    return profile
+
+
 def classic_domestic_rules(source: Path | None) -> list[str]:
     if not source:
         return [f"DOMAIN-SUFFIX,{d},DIRECT" for d in
                 ("baidu.com", "qq.com", "taobao.com", "tmall.com", "alipay.com", "jd.com", "bilibili.com")]
-    if yaml is None:
-        raise SystemExit("PyYAML is needed to read the existing rules")
-    rules = yaml.safe_load(source.read_bytes()).get("rules", [])
+    rules = read_reference_profile(source).get("rules", [])
     parsed = [r.split(",") for r in rules if isinstance(r, str)]
     domestic = {r[2] for r in parsed if len(r) >= 3 and r[:2] == ["GEOIP", "CN"]}
     if len(domestic) != 1:
@@ -264,7 +310,8 @@ def main() -> None:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
-    p.add_argument("--base", type=Path, help="existing desktop YAML or full-tunnel phone YAML for mobile-cn-split")
+    p.add_argument("--base", type=Path, help="existing YAML used only by the selected mode")
+    p.add_argument("--only-node", help="exact direct Shadowsocks node to extract from --base")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
@@ -275,9 +322,17 @@ def main() -> None:
         p.error("Generate private profiles in WSL. Keep the order, keys and YML inside the Linux filesystem.")
     if (args.classic_android and args.mode != "mobile-cn-split") or (args.classic_rules_from and not args.classic_android):
         p.error("--classic-rules-from requires --classic-android with --mode mobile-cn-split")
+    if args.only_node is not None and (not args.only_node.strip() or args.mode not in ("mobile-cn-split", "mobile-global")
+                           or not args.base or args.state or args.base_default):
+        p.error("--only-node needs --base with mobile-cn-split or mobile-global, without --state")
     if any(path and args.output.resolve() == path.resolve() for path in (args.state, args.base, args.classic_rules_from)):
         p.error("output must differ from the private state and existing base profile")
-    if args.mode == "existing-rules":
+    if args.only_node is not None:
+        state = direct_ss_state_from_profile(read_reference_profile(args.base), args.only_node)
+        profile = global_profile(state, args.name)
+        if args.mode == "mobile-cn-split":
+            profile = mainland_split(profile, args.name, args.classic_android, args.classic_rules_from)
+    elif args.mode == "existing-rules":
         if not (args.use_x or args.domain) or not args.base or args.state or args.base_default:
             p.error("existing-rules needs --use-x or --domain, --base, and an existing --name")
         if yaml is None:

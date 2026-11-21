@@ -1,7 +1,7 @@
 ---
 name: elidli-personal-vpn-setup
 metadata:
-  version: "1.2.2"
+  version: "1.3.0"
 license: MIT
 description: Plan and set up a personal VPN with an offline VPS catalog, official price checks and Clash-compatible mobile or desktop routing. 帮个人按地区、固定或独享出口、预算与流量选择 VPN，复核已选套餐，接续已购主机，为手机国内外分流及电脑按站点分流生成配置。
 ---
@@ -13,6 +13,8 @@ description: Plan and set up a personal VPN with an offline VPS catalog, officia
 ## 每台设备的分流确认
 
 选购、已购和只改客户端都沿用这条规则。先从对话里分别读出每台设备要接管哪些应用、哪些目的地走代理、代理出口在哪。只改客户端时直接处理指定设备。用户所在城市用于判断接入线路；「日本固定 IP」说明代理出口在日本，仍需从用户原话判断哪些连接要走它。
+
+**先确定允许经过哪些节点，再确定哪些网站走哪个出口。** “参考 iKuuu 的规则”只说明规则来源。把参考文件当本地资料，读取相关域名与匹配顺序。可以从已有部署状态生成自有节点。若用户说“只走自己的 VPS，iKuuu 只借鉴思路”，直接按单出口交付：国内直连，需代理的连接只进入用户确认的自有节点。该节点不可用时，国外连接应失败。测速也只用用户允许的线路。只有用户明确要使用某个第三方作前置或备用时，才把它作为实际线路配置、保留和测试。
 
 **只在答案会改变配置时问一次。** 中国大陆手机用户只说「全局」「手机全部都走」「所有 App 都生效」，可以这样问，把日本替换为已选出口，出口未知时说「代理」：
 
@@ -32,7 +34,7 @@ description: Plan and set up a personal VPN with an offline VPS catalog, officia
 
 **按用途自动启用 X 优先规则。** 对用户明确要用 X（Twitter、推特、发推、浏览 X 图片或视频）的每台设备，生成配置时给 `scripts/client_config.py` 传 `--use-x`。复用对话中已说明的用途，无需用户再确认加速选项或逐个提供域名。只在用户指定的设备启用；明确要求 X 直连、排除 X 或使用其他出口时，以该设备的要求为准。生成器把 `twimg.com`、`x.com`、`twitter.com`、`t.co` 的四条域名后缀规则置顶，指向该设备选好的代理组，先于国内 IP 判断匹配。手机继续使用已选分流模式；电脑只有 X 走代理时使用 `--mode desktop-domains --use-x`。
 
-已经有规则模式的配置且只要补 X 优先匹配时，使用 `--mode existing-rules --use-x --base 原配置 --name 已有出口组 --output 私有副本`。输出后核对四条规则位于最前、图片和视频命中 `twimg.com`，并确认普通国内站点沿用原路径。
+已经有规则模式的配置，且用户要保留当前节点和路由、只补 X 优先匹配时，使用 `--mode existing-rules --use-x --base 原配置 --name 已有出口组 --output 私有副本`。输出后核对四条规则位于最前、图片和视频命中 `twimg.com`，并确认普通国内站点沿用原路径。
 
 参考用户本机已有的分流配置时，先看已选服务的域名与专属资源域名如何匹配，再看国内直连、拦截和最终兜底。对用户点名的其他国外服务，通过可重复的 `--domain` 加入已核实的专属域名。例如使用 YouTube 时可一起匹配 `youtube.com`、`googlevideo.com` 和 `ytimg.com`。GitHub 或 AI 服务同理，按实际用途选取。优先规则会先于已有规则生效，加入前核对细分域名上是否有要保留的直连或拦截例外；有冲突时缩小域名范围或沿用该例外。将订阅及成员列表留在用户本机。未点名的国外服务继续按现有规则选路，只有实测过的服务可报告提速结果。
 
@@ -48,7 +50,7 @@ description: Plan and set up a personal VPN with an offline VPS catalog, officia
 python3 scripts/recommend.py --country JP --traffic-gb 100 --max-months 1 --ip-type isp --static required --exclusive preferred --json
 ```
 
-`--budget` 是每月总预算，`--max-upfront` 是一次可付金额，`--budget-currency` 是两者币种。完整参数见 `--help`。已有前置且接受单买出口时才给对应参数。若只是“优先 ISP”且同类均不合格，可用 `--ip-type any` 再查并把放宽条件的备选写清楚。不能把入口代理、出口、配套增购当成同类；对组合按每项价格和两段流量分别核算。要保留原地址时直接核已有出口。若实际连接线路重要，给所选地点的测试入口，请用户从实际运营商及常用时段验证。
+`--budget` 是每月总预算，`--max-upfront` 是一次可付金额，`--budget-currency` 是两者币种。完整参数见 `--help`。用户明确允许使用已有前置且接受单买出口时才给对应参数。单出口需求优先筛选目标地区自有主机，复核它能否直接连接以及是否满足地址要求。若只是“优先 ISP”且同类均不合格，可用 `--ip-type any` 再查并把放宽条件的备选写清楚。不能把入口代理、出口、配套增购当成同类；对组合按每项价格和两段流量分别核算。要保留原地址时直接核已有出口。若实际连接线路重要，给所选地点的测试入口，请用户从实际运营商及常用时段验证。
 
 首轮一屏，通常一个主选和一个有明显取舍的备选。写清所需商品数、地区、型号、原币首付、续费、数据日期、按用量预计总价及不能确认的一项。续费未公开就写未知。月均、季度预付、按量估算和主机裸价按各自口径表述。过期快照仍注明采集时间；核算汇率注明日期。库中只有条件候选时直说“还没有确认满足全部要求的套餐”。十家是所收录的候选范围。用户明确要展开时可用 `--limit 10`。在对话保留候选记录 ID、地区和目标规格。报价身份见 [报价记录说明](references/offer-identities.md)。
 
@@ -62,7 +64,11 @@ python3 scripts/recommend.py --country JP --traffic-gb 100 --max-months 1 --ip-t
 
 先确认用户对该服务器有管理权限且已授权部署。只针对该购买项或已有主机。**首版自动部署对象为带公网 IPv4、systemd、可信 SSH 的 Debian/Ubuntu VPS**。新用户默认走这一条购买到部署的路径。机房主机加保留地址时，先核对静态地址已实际绑定。单买 HTTP/SOCKS 出口、托管服务、iOS/其他客户端按所选产品与客户端的官方接入方式处理，明确可自动化的范围和缺项。涉及第二项商品时先核是否已有前置以及总价。不要把一个代理账户作为 SSH 主机。
 
-按 [部署与客户端说明](references/deployment.md) 执行 `deploy.py plan`、只读 `inspect`、然后 `deploy`。以 root 登录时给 inspect 和 deploy 都传 `--remote-root`。普通账号需可执行 `sudo -n`。用本地 SSH 别名、已信任的主机密钥及已授权登录，遇到首次信任或密码交给本机系统界面。中国大陆手机的区域分流选 `mobile-cn-split`，仅在用户明确所有目的地都走代理时选 `mobile-global`。两者都接管手机应用流量。先认出手机内核。经典 Clash for Android 或导入时提示 `cannot unmarshal !!seq into string` 时，区域分流使用 `--classic-android`，输出单字符串 DNS 策略、内嵌域名规则和 `GEOIP,CN,DIRECT`。已有可用国内分流配置时，可用 `--classic-rules-from` 继承其中的国内域名。已有链式备用时按目标内核分别生成：经典 Clash 使用 relay，Mihomo 使用 dialer-proxy。交付前对照前置可用和临时不可达两种情况，确认经过前置并获得约定出口。经典版的链式备用仅支持 TCP。已有启用 TUN、配置了 DNS 的单条 MATCH 手机 YAML 时，国内外分流可用 `--base` 继承节点和备用出口。另为桌面生成独立配置。桌面仅 X 走代理时按前述用途传入 `--use-x`，额外指定的网站可用 `--domain` 补充。开启规则模式，将目标规则放到能命中的位置；其他连接沿用原有规则。手机全局同时核对 VPN 接管、DNS、IPv6、UDP、应用绕过与断线保护。若是 iOS，明确已安装的具体客户端；Android 的系统 VPN 授权和应用专有选项交由对应设备完成。凭据文件只保存在用户私有位置。
+按 [部署与客户端说明](references/deployment.md) 执行 `deploy.py plan`、只读 `inspect`、然后 `deploy`。以 root 登录时给 inspect 和 deploy 都传 `--remote-root`。普通账号需可执行 `sudo -n`。用本地 SSH 别名、已信任的主机密钥及已授权登录，遇到首次信任或密码交给本机系统界面。中国大陆手机的区域分流选 `mobile-cn-split`，仅在用户明确所有目的地都走代理时选 `mobile-global`。两者都接管手机应用流量。先认出手机内核。经典 Clash for Android 或导入时提示 `cannot unmarshal !!seq into string` 时，区域分流使用 `--classic-android`，输出单字符串 DNS 策略、内嵌域名规则和 `GEOIP,CN,DIRECT`。已有可用国内分流配置时，可用 `--classic-rules-from` 继承其中的国内域名。用户明确要保留链式备用时，按目标内核分别生成：经典 Clash 使用 relay，Mihomo 使用 dialer-proxy。交付前对照前置可用和临时不可达两种情况，确认经过前置并获得约定出口。经典版的链式备用仅支持 TCP。用户确认沿用旧节点与备用时，已有启用 TUN、配置了 DNS 的单条 MATCH 手机 YAML 才使用 `--base` 继承。另为桌面生成独立配置。桌面仅 X 走代理时按前述用途传入 `--use-x`，额外指定的网站可用 `--domain` 补充。开启规则模式，将目标规则放到能命中的位置；其他连接沿用原有规则。手机全局同时核对 VPN 接管、DNS、IPv6、UDP、应用绕过与断线保护。若是 iOS，明确已安装的具体客户端；Android 的系统 VPN 授权和应用专有选项交由对应设备完成。凭据文件只保存在用户私有位置。
+
+**单出口手机配置。** 有自有服务器的部署状态时用 `--state` 新建。只有旧 YAML 时，用 `--base 私有旧配置 --only-node '已确认的自有节点名'` 重建，选择 `mobile-cn-split` 或 `mobile-global`；用 X 则继续加 `--use-x`。从商家回执或用户已有记录核对节点的服务器地址，显示名本身只能用于选择。用户只要求借鉴思路时，提取相关匹配方法。用户明确要沿用本地国内规则表时，经典客户端可另传 `--classic-rules-from`。重建使用模板的 DNS 和已选分流，按已确认的用途重加例外。验收要看到一个自有代理节点、一个只含该节点的出口选择组，以及相应的直连/兜底规则。再核对真实公网出口。单看出口 IP 无法区分直连与经前置到达同一出口。
+
+**用户觉得慢时按症状验证。** 针对实际 App/域名，分别记录规则匹配等待、首字节时间和固定大小内容的传输耗时。首包慢先核对域名是否在 GeoIP 判断前命中；首包快但播放卡顿时，在同一出口限量测视频分段。手机和电脑共用 Wi‑Fi 时，先排除电脑自身 VPN 对结果的影响，区分电脑对照和手机实测。需要比较接入网络时，在相同自有节点上对照 Wi‑Fi 与蜂窝。仅在用户允许的节点内测试或提出切换建议。
 
 如果服务监听正常但客户端连不到，从授权客户端试一次协议连接，读主机防火墙与该实例的云入站规则。需要开放端口时复用用户已给的对应授权，只给这台实例添加所选端口的 TCP、UDP 入站。保留工作负载原有规则。如果改动会影响共享安全组、同项目其他主机或扩大原授权，先说明影响。记下新增规则，便于单独撤回。对于云计费，记录静态地址绑定和出站费用。
 
