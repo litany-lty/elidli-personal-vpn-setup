@@ -1,0 +1,11 @@
+{
+  "base": "EUR",
+  "date": "2026-11-20",
+  "source": "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml",
+  "rates": {
+    "EUR": 1.0,
+    "USD": 1.0990,
+    "CNY": 7.3388
+  },
+  "note": "欧洲央行参考汇率。仅用于离线预算初筛，付款以商家结账币种和支付渠道为准。"
+}

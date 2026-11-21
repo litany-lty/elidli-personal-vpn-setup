@@ -1,0 +1,4 @@
+interface:
+  display_name: "ELIDLI 个人 VPN 搭建助手"
+  short_description: "按预算离线选套餐，选定后核对官网实价，并配置自有主机与 Clash 分流"
+  default_prompt: "用 $elidli-personal-vpn-setup 帮我按预算挑选合适的出口，选定后复核官网，接续我购买的主机并配置手机和电脑。"

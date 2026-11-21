@@ -1,0 +1,16 @@
+/dist/
+/private/
+/.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.zip
+*.pem
+*.key
+*.yaml
+*.yml
+!/agents/openai.yaml
+.env
+.env.*
+/runner-check/
+!/.github/workflows/smoke.yml
