@@ -13,10 +13,12 @@
 如已安装 Git，可在项目根目录直接安装当前发布版本。在本机新建技能目录后，执行：
 
 ```sh
-git clone --depth 1 --branch v1.2.1 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
+git clone --depth 1 --branch v1.2.2 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
 ```
 
 从旧版升级时，将名称为 `personal-vpn-setup` 的旧 Skill 目录移出 Codex 扫描路径，避免出现两个入口。既有服务器服务名和密钥状态目录沿用原有位置。
+
+如果某台设备要用 X（Twitter），直接告诉助手，例如「手机刷 X 图片和视频，电脑只让 X 走日本」。助手会为相应设备自动把 X 和媒体域名放在国内 IP 判断之前。无需手动维护域名清单。对于点名的其他国外服务，也可参考本机已有分流配置，将站点和专属资源域名一起优先匹配；其余流量沿用已有策略。
 
 ## 先试一次
 

@@ -31,7 +31,7 @@ For a non-root SSH account replace `root@$vps_host` with its SSH alias or `user@
 
 ```bash
 python3 scripts/client_config.py --state ~/.local/state/personal-vpn-setup/personal.json --mode mobile-cn-split --output private/phone.yaml
-python3 scripts/client_config.py --state ~/.local/state/personal-vpn-setup/personal.json --mode desktop-domains --base ~/.config/clash/current.yaml --domain x.com --domain twitter.com --output private/desktop-x.yaml
+python3 scripts/client_config.py --state ~/.local/state/personal-vpn-setup/personal.json --mode desktop-domains --base ~/.config/clash/current.yaml --use-x --output private/desktop-x.yaml
 ```
 
 For a mainland-China phone running Mihomo, use `mobile-cn-split` in the client's Rule mode. VPN capture stays enabled. Local networks, mainland domains and mainland destination IPs use DIRECT. Other destinations use the selected outbound. Known mainland domains resolve through direct domestic DoH. The default resolver for other domains uses the outbound. The public domain and IP rule sets download through the selected proxy on first import, are cached on the phone, and refresh daily while the client is running. Check that both providers load before accepting the profile. Use the Connections panel to check a mainland site and an overseas site separately. Routing depends on the matched domain or destination IP; services can use multiple domains. [Mihomo rule providers](https://wiki.metacubex.one/config/rule-providers/) · [Rule data](https://github.com/MetaCubeX/meta-rules-dat)
@@ -43,6 +43,8 @@ Use `mobile-global` when the user explicitly wants a proxy for every destination
 ```bash
 python3 scripts/client_config.py --mode mobile-cn-split --base private/phone-old.yaml --name 'Original phone group' --output private/phone-split.yaml
 ```
+
+When X/Twitter is a stated purpose for the device, include `--use-x` with its chosen mode. The four domain suffixes (`twimg.com`, `x.com`, `twitter.com`, `t.co`) go to the selected group before GEOIP or a general rule can trigger an IP lookup. The `twimg.com` suffix covers both image and video subdomains. For an existing Rule-mode profile use `--mode existing-rules --use-x --base private/current.yaml --name "Existing group" --output private/with-x.yaml`. For other requested services use repeated `--domain` values for their site and dedicated asset domains. Check for existing direct/block exceptions before promoting a suffix. Then verify a target and a non-target connection in the client.
 
 After deployment, `active,running` and both `tcp,udp` are required. Then load the generated profile in the intended client and verify the expected public exit. For a desktop split profile, also verify one non-target request retains its previous route. To recover before client cutover, keep using the original profile. If a same-name remote service replacement fails, the deployer restores and restarts the previous same-name unit; if a later manual rollback is required, use the provider console or SSH to stop `personal-vpn-<service-id>` and restore from your normal host backup procedure.
 

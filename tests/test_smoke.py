@@ -11,6 +11,8 @@ open the network, connect through SSH, or change system proxy/VPN settings.
 from __future__ import annotations
 
 import csv
+import copy
+import importlib.util
 import json
 import os
 import stat
@@ -24,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 REFERENCES = ROOT / "references"
+X_DOMAINS = ("twimg.com", "x.com", "twitter.com", "t.co")
 
 
 def run(script: str, *arguments: object) -> subprocess.CompletedProcess[str]:
@@ -61,6 +64,41 @@ def load_yaml_or_json(path: Path) -> dict:
                 "client_config.py emitted YAML, but PyYAML is unavailable for smoke-test inspection"
             ) from error
         return yaml.safe_load(content)
+
+
+def check_x_priority_logic() -> None:
+    """Exercise the cross-platform transformation without private files or network."""
+    module_spec = importlib.util.spec_from_file_location(
+        "elidli_client_config", SCRIPTS / "client_config.py"
+    )
+    assert module_spec and module_spec.loader
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+
+    ordinary = {
+        "rules": ["IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "MATCH,DIRECT"],
+        "proxies": [],
+        "proxy-groups": [],
+    }
+    unchanged = copy.deepcopy(ordinary)
+    profile = copy.deepcopy(ordinary)
+    profile["rules"].insert(1, "DOMAIN-SUFFIX,x.com,Old exit")
+
+    returned = module.apply_x_priority(profile, "Japan exit")
+    assert returned is profile
+    expected = [f"DOMAIN-SUFFIX,{domain},Japan exit" for domain in X_DOMAINS]
+    assert profile["rules"][:4] == expected
+    assert profile["rules"][4:] == unchanged["rules"], "non-X routing was not preserved"
+
+    assert module.apply_x_priority(profile, "Japan exit") is profile
+    assert profile["rules"][:4] == expected
+    assert all(profile["rules"].count(rule) == 1 for rule in expected), "X rules duplicated"
+
+
+    sites = ("youtube.com", "googlevideo.com")
+    other = copy.deepcopy(ordinary)
+    module.apply_domain_priority(other, "Japan exit", sites)
+    assert other["rules"] == [f"DOMAIN-SUFFIX,{site},Japan exit" for site in sites] + ordinary["rules"]
 
 
 def check_catalog_and_cli() -> None:
@@ -140,12 +178,46 @@ def check_client_generation(directory: Path) -> str:
     )
     expect_success(generated, "classic Android profile generation")
     profile = load_yaml_or_json(phone)
+    ordinary_x_rules = [
+        f"DOMAIN-SUFFIX,{domain},个人VPN·固定出口" for domain in X_DOMAINS
+    ]
+    assert not any(rule in profile["rules"] for rule in ordinary_x_rules), (
+        "ordinary phone generation enabled X priority without --use-x"
+    )
     assert profile["tun"]["enable"] is True
     assert profile["rules"][-2:] == ["GEOIP,CN,DIRECT", "MATCH,个人VPN·固定出口"]
     assert "rule-providers" not in profile
     assert all(isinstance(value, str) for value in profile["dns"]["nameserver-policy"].values())
     assert profile["proxies"][0]["password"] == "synthetic-smoke-test-only"
     assert stat.S_IMODE(phone.stat().st_mode) == 0o600
+
+    x_phone = directory / "phone-x.yaml"
+    generated = run(
+        "client_config.py",
+        "--state", state,
+        "--output", x_phone,
+        "--mode", "mobile-cn-split",
+        "--classic-android",
+        "--use-x",
+    )
+    expect_success(generated, "classic Android X profile generation")
+    x_profile = load_yaml_or_json(x_phone)
+    x_rules = ordinary_x_rules
+    assert x_profile["rules"][:4] == x_rules
+    assert x_profile["rules"][4:] == profile["rules"], "X mode changed non-X mobile rules"
+
+    desktop = directory / "desktop-x.yaml"
+    generated = run(
+        "client_config.py",
+        "--state", state,
+        "--output", desktop,
+        "--mode", "desktop-domains",
+        "--use-x",
+    )
+    expect_success(generated, "desktop X profile generation without --domain")
+    desktop_profile = load_yaml_or_json(desktop)
+    assert desktop_profile["rules"][:4] == x_rules
+    assert desktop_profile["rules"][-1] == "MATCH,DIRECT"
     return "passed"
 
 
@@ -167,12 +239,14 @@ def main() -> int:
     assert not missing, "missing packaged files: " + ", ".join(missing)
 
     check_catalog_and_cli()
+    check_x_priority_logic()
     with tempfile.TemporaryDirectory(prefix="personal-vpn-smoke-") as temporary:
         directory = Path(temporary)
         check_order_state(directory)
         client_result = check_client_generation(directory)
     print("PASS: package layout, catalog recommendation, legacy ID and ready order state")
-    print(f"Classic Android synthetic profile: {client_result}")
+    print("PASS: X intent adds four prioritized, de-duplicated rules and preserves other routes")
+    print(f"Classic Android and desktop X profiles: {client_result}")
     print("No network, SSH, VPN or system-proxy action was performed.")
     return 0
 

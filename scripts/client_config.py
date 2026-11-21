@@ -202,6 +202,27 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False, rules_fr
     return profile
 
 
+X_DOMAINS = ("twimg.com", "x.com", "twitter.com", "t.co")
+
+
+def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...]) -> dict:
+    """Place explicitly requested service suffixes ahead of DNS-dependent rules."""
+    selected = dict.fromkeys(domains)
+
+    def is_selected_suffix(rule: str) -> bool:
+        parts = rule.split(",", 2)
+        return (len(parts) == 3 and parts[0].strip().upper() == "DOMAIN-SUFFIX"
+                and parts[1].strip().lower().rstrip(".") in selected)
+
+    priority = [f"DOMAIN-SUFFIX,{domain},{outbound}" for domain in selected]
+    profile["rules"] = priority + [rule for rule in profile["rules"] if not is_selected_suffix(rule)]
+    return profile
+
+
+def apply_x_priority(profile: dict, outbound: str) -> dict:
+    return apply_domain_priority(profile, outbound, X_DOMAINS)
+
+
 def desktop_profile(state: dict, name: str, domains: list[str], base: Path | None,
                     base_default: str | None) -> dict:
     if base and yaml is None:
@@ -241,11 +262,12 @@ def main() -> None:
     p.add_argument("--state", type=Path,
                    help="mode-600 deployment state or private proxy spec JSON")
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains"), required=True)
+    p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
     p.add_argument("--base", type=Path, help="existing desktop YAML or full-tunnel phone YAML for mobile-cn-split")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
-    p.add_argument("--domain", action="append", default=[])
+    p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
+    p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
     p.add_argument("--classic-android", action="store_true", help="inline domain rules and GEOIP for classic Clash for Android")
     p.add_argument("--classic-rules-from", type=Path, help="optional known-working profile with a named Chinese domestic group")
     args = p.parse_args()
@@ -255,7 +277,19 @@ def main() -> None:
         p.error("--classic-rules-from requires --classic-android with --mode mobile-cn-split")
     if any(path and args.output.resolve() == path.resolve() for path in (args.state, args.base, args.classic_rules_from)):
         p.error("output must differ from the private state and existing base profile")
-    if args.mode == "mobile-cn-split" and args.base:
+    if args.mode == "existing-rules":
+        if not (args.use_x or args.domain) or not args.base or args.state or args.base_default:
+            p.error("existing-rules needs --use-x or --domain, --base, and an existing --name")
+        if yaml is None:
+            p.error("reading an existing YAML profile requires PyYAML")
+        profile = yaml.safe_load(args.base.read_bytes())
+        if (not isinstance(profile, dict) or str(profile.get("mode", "rule")).lower() != "rule"
+                or not isinstance(profile.get("rules"), list)
+                or not all(isinstance(rule, str) for rule in profile["rules"])):
+            p.error("the base must be a Rule-mode profile with a rules list")
+        if args.name not in {group["name"] for group in profile.get("proxy-groups", [])}:
+            p.error("--name must identify the existing outbound group for X")
+    elif args.mode == "mobile-cn-split" and args.base:
         if yaml is None or args.state:
             p.error("phone profile migration needs PyYAML and --base alone")
         profile = yaml.safe_load(args.base.read_bytes())
@@ -267,8 +301,8 @@ def main() -> None:
             p.error("--state is required for a new profile")
         state = private_state(args.state)
         if args.mode == "desktop-domains":
-            if not args.domain:
-                p.error("desktop-domains requires at least one --domain")
+            if not (args.domain or args.use_x):
+                p.error("desktop-domains requires --use-x or at least one --domain")
             profile = desktop_profile(state, args.name, args.domain, args.base, args.base_default)
         else:
             if args.base:
@@ -276,6 +310,10 @@ def main() -> None:
             profile = global_profile(state, args.name)
             if args.mode == "mobile-cn-split":
                 profile = mainland_split(profile, args.name, args.classic_android, args.classic_rules_from)
+    if args.domain and args.mode != "desktop-domains":
+        apply_domain_priority(profile, args.name, tuple(args.domain))
+    if args.use_x:
+        apply_x_priority(profile, args.name)
     if yaml is None:
         content = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
     else:
