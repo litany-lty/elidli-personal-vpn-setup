@@ -405,6 +405,14 @@ X_DOMAINS = ("twimg.com", "x.com", "twitter.com", "t.co")
 def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...],
                           prioritize_dns: bool = False) -> dict:
     """Place explicitly requested service suffixes ahead of DNS-dependent rules."""
+    if prioritize_dns:
+        normalized = []
+        for domain in domains:
+            suffix = valid_dns_suffix(domain)
+            if suffix is None:
+                raise SystemExit("expected a domain suffix for the mobile service priority rule")
+            normalized.append(suffix)
+        domains = tuple(normalized)
     selected = dict.fromkeys(domains)
 
     def is_selected_suffix(rule: str) -> bool:

@@ -294,7 +294,7 @@ def check_dual_core_generation(directory: Path) -> None:
         classic=True, rules_from=reference,
     )
     module.apply_domain_priority(
-        classic, outbound, ("service.example.cn",), prioritize_dns=True,
+        classic, outbound, ("Service.Example.CN.",), prioritize_dns=True,
     )
     module.apply_x_priority(classic, outbound, prioritize_dns=True)
 
@@ -329,7 +329,7 @@ def check_dual_core_generation(directory: Path) -> None:
 
     mihomo = module.mainland_split(module.global_profile(TEST_STATE, outbound), outbound)
     module.apply_domain_priority(
-        mihomo, outbound, ("service.example.cn",), prioritize_dns=True,
+        mihomo, outbound, ("Service.Example.CN.",), prioritize_dns=True,
     )
     module.apply_x_priority(mihomo, outbound, prioritize_dns=True)
     assert mihomo["rules"][:4] == [
