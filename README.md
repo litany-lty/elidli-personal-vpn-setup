@@ -13,12 +13,14 @@
 如已安装 Git，可在项目根目录直接安装当前发布版本。在本机新建技能目录后，执行：
 
 ```sh
-git clone --depth 1 --branch v1.3.0 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
+git clone --depth 1 --branch v1.4.0 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
 ```
 
 从旧版升级时，将名称为 `personal-vpn-setup` 的旧 Skill 目录移出 Codex 扫描路径，避免出现两个入口。既有服务器服务名和密钥状态目录沿用原有位置。
 
 如果某台设备要用 X（Twitter），直接告诉助手，例如「手机刷 X 图片和视频，电脑只让 X 走日本」。助手会为相应设备自动把 X 和媒体域名放在国内 IP 判断之前。无需手动维护域名清单。对于点名的其他国外服务，也可参考本机已有分流配置，将站点和专属资源域名一起优先匹配；其余流量沿用已有策略。
+
+手机选择国内外分流时，局域网和大陆公网 IP 直连，其余目的地走所选出口。国内常用域名清单用于选择 DNS。经典 Clash 使用本地 DNS 隧道，Mihomo 使用指定出口的加密 DNS。Mihomo 默认自动更新大陆 IP 规则，也可从可信 CIDR 文本生成单文件配置。
 
 **只用自己的节点也可以借鉴别人的规则。** 例如「手机国内直连、国外只走自己的日本 VPS。参考 iKuuu 的规则，X 优先」。助手会保留一个自有出口，参考配置仅提供域名分流。若直接从旧手机 YAML 重建，可以用 `--only-node` 指定已确认的自有节点。线路慢时，助手会在这个出口上区分选路等待与视频传输耗时。[单出口示例](references/deployment.md#single-exit-phone)
 
@@ -64,6 +66,6 @@ python3 -m venv .venv
 
 Download the [release ZIP](https://github.com/litany-lty/elidli-personal-vpn-setup/releases/latest/download/elidli-personal-vpn-setup.zip) and extract it into your project's `.agents/skills/` or your user's `~/.agents/skills/`. The final folder must be `elidli-personal-vpn-setup` with `SKILL.md` directly inside. Invoke `$elidli-personal-vpn-setup` in Codex and describe your devices, budget, monthly traffic and desired exit country in your own language. For example: “My phone should access mainland Chinese sites directly and use Japan for other sites. On my laptop only X should use Japan. Show me a monthly plan first.”
 
-To use only your own VPS, state that constraint per device. A reference profile can inform domain rules without contributing a relay, a fallback node or subscription credentials.
+To use only your own VPS, state that constraint per device. A local reference profile can supply domestic DNS hints. Use the confirmed node as the sole outbound when the user wants a single exit.
 
 From the extracted folder, run `python3 tests/test_smoke.py` to check the catalog and supported local workflows without credentials. On Windows use `py -3 -X utf8 tests/test_smoke.py`. Python 3.10+ is required. Use macOS, Linux or WSL for private profile generation and SSH deployment to your own Debian/Ubuntu VPS. The provider catalog is a dated snapshot. Pick an offer before checking live prices, pay the provider yourself, and verify your exit and routing on each device.

@@ -27,6 +27,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 REFERENCES = ROOT / "references"
 X_DOMAINS = ("twimg.com", "x.com", "twitter.com", "t.co")
+TEST_STATE = {
+    "kind": "ss",
+    "server": "192.0.2.10",
+    "port": 28447,
+    "method": "aes-128-gcm",
+    "password": "synthetic-smoke-test-only",
+}
 
 
 def run(script: str, *arguments: object) -> subprocess.CompletedProcess[str]:
@@ -66,14 +73,17 @@ def load_yaml_or_json(path: Path) -> dict:
         return yaml.safe_load(content)
 
 
-def check_x_priority_logic() -> None:
-    """Exercise the cross-platform transformation without private files or network."""
-    module_spec = importlib.util.spec_from_file_location(
-        "elidli_client_config", SCRIPTS / "client_config.py"
-    )
+def load_client_module(name: str = "elidli_client_config") -> object:
+    module_spec = importlib.util.spec_from_file_location(name, SCRIPTS / "client_config.py")
     assert module_spec and module_spec.loader
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
+    return module
+
+
+def check_x_priority_logic() -> None:
+    """Exercise the cross-platform transformation without private files or network."""
+    module = load_client_module()
 
     ordinary = {
         "rules": ["IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "MATCH,DIRECT"],
@@ -103,12 +113,7 @@ def check_x_priority_logic() -> None:
 
 def check_single_exit_logic(directory: Path) -> None:
     """Prove a named direct node cannot carry unrelated providers into a new profile."""
-    module_spec = importlib.util.spec_from_file_location(
-        "elidli_single_exit", SCRIPTS / "client_config.py"
-    )
-    assert module_spec and module_spec.loader
-    module = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
+    module = load_client_module("elidli_single_exit")
 
     own_name = "My dedicated Japan exit"
     third_party_marker = "THIRD-PARTY-SENTINEL"
@@ -178,10 +183,9 @@ def check_single_exit_logic(directory: Path) -> None:
         ],
     }), encoding="utf-8")
 
-    imported = module.classic_domestic_rules(reference)
-    assert imported == [
-        "DOMAIN-SUFFIX,example.cn,DIRECT", "IP-CIDR,203.0.113.0/24,DIRECT"
-    ]
+    hints = module.classic_domestic_dns_hints(reference)
+    assert ("DOMAIN-SUFFIX", "example.cn") in hints
+    assert all(value != "203.0.113.0/24" for _, value in hints)
 
     if os.name != "nt":
         base = directory / "old-profile.json"
@@ -194,9 +198,32 @@ def check_single_exit_logic(directory: Path) -> None:
         written = load_yaml_or_json(output)
         assert written["proxy-groups"] == rebuilt["proxy-groups"]
         assert written["proxies"] == rebuilt["proxies"]
-        assert all(rule in written["rules"] for rule in imported)
+        assert "+.example.cn" in written["dns"]["nameserver-policy"]
+        assert "DOMAIN-SUFFIX,example.cn,DIRECT" not in written["rules"]
+        assert "IP-CIDR,203.0.113.0/24,DIRECT" not in written["rules"]
         assert "proxy-providers" not in written and source_url not in str(written)
         assert run(*command, "").returncode != 0
+
+        cidrs = directory / "cn-cidrs.txt"
+        cidrs.write_text("# synthetic offline fixture\n1.0.1.0/24\n240e::/20\n", encoding="utf-8")
+        mihomo_output = directory / "only-owned-mihomo.yaml"
+        mihomo_command = (
+            "client_config.py", "--mode", "mobile-cn-split", "--base", base,
+            "--name", "Personal exit", "--use-x", "--cn-cidrs", cidrs,
+            "--output", mihomo_output, "--only-node",
+        )
+        expect_success(run(*mihomo_command, own_name), "single-exit Mihomo CLI")
+        mihomo_written = load_yaml_or_json(mihomo_output)
+        assert mihomo_written["rules"][:4] == [
+            f"DOMAIN-SUFFIX,{domain},Personal exit" for domain in X_DOMAINS
+        ]
+        assert mihomo_written["rule-providers"] == {
+            "cn-ip": {
+                "type": "inline", "behavior": "ipcidr",
+                "payload": ["1.0.1.0/24", "240e::/20"],
+            }
+        }
+        assert "proxy-providers" not in mihomo_written and source_url not in str(mihomo_written)
 
 
 def check_catalog_and_cli() -> None:
@@ -246,19 +273,127 @@ def check_order_state(directory: Path) -> None:
     assert data["receipt"] == {"host": "vpn.example.org", "kind": "vps"}
 
 
+def check_dual_core_generation(directory: Path) -> None:
+    """Run both mobile generators as pure functions on macOS, Linux and Windows."""
+    module = load_client_module("elidli_dual_core")
+    outbound = "Synthetic exit"
+
+    reference = directory / "classic-dns-reference.json"
+    reference.write_text(json.dumps({
+        "rules": [
+            "DOMAIN-SUFFIX,example.cn,Domestic DNS",
+            "DOMAIN,x.com,Domestic DNS",
+            "DOMAIN-KEYWORD,ignored,Domestic DNS",
+            "IP-CIDR,198.51.100.0/24,Domestic DNS",
+            "GEOIP,CN,Domestic DNS",
+            "DOMAIN-SUFFIX,other.example,Foreign",
+        ]
+    }), encoding="utf-8")
+    classic = module.mainland_split(
+        module.global_profile(TEST_STATE, outbound), outbound,
+        classic=True, rules_from=reference,
+    )
+    module.apply_domain_priority(
+        classic, outbound, ("service.example.cn",), prioritize_dns=True,
+    )
+    module.apply_x_priority(classic, outbound, prioritize_dns=True)
+
+    assert classic["clash-for-android"]["append-system-dns"] is False
+    assert classic["dns"]["listen"] == "127.0.0.1:1053"
+    assert classic["dns"]["nameserver"] == [
+        f"tcp://{tunnel['address']}" for tunnel in classic["tunnels"]
+    ]
+    assert len(classic["tunnels"]) == 2
+    assert {tunnel["target"] for tunnel in classic["tunnels"]} == {
+        "1.1.1.1:53", "9.9.9.9:53",
+    }
+    assert all(
+        tunnel["network"] == ["tcp"]
+        and tunnel["address"].startswith("127.0.0.1:")
+        and tunnel["proxy"] == outbound
+        for tunnel in classic["tunnels"]
+    )
+    classic_policy = classic["dns"]["nameserver-policy"]
+    assert "+.cn" in classic_policy
+    assert "+.example.cn" in classic_policy
+    assert classic_policy["+.service.example.cn"] == classic["dns"]["nameserver"][0]
+    assert all(isinstance(value, str) for value in classic_policy.values())
+    assert all(f"+.{domain}" not in classic_policy for domain in X_DOMAINS), "X should use both default DNS tunnels"
+    assert classic["rules"][:4] == [
+        f"DOMAIN-SUFFIX,{domain},{outbound}" for domain in X_DOMAINS
+    ]
+    assert classic["rules"][4] == f"DOMAIN-SUFFIX,service.example.cn,{outbound}"
+    assert classic["rules"][-2:] == ["GEOIP,CN,DIRECT", f"MATCH,{outbound}"]
+    assert "DOMAIN-SUFFIX,example.cn,DIRECT" not in classic["rules"]
+    assert not any("198.51.100.0/24" in rule for rule in classic["rules"])
+
+    mihomo = module.mainland_split(module.global_profile(TEST_STATE, outbound), outbound)
+    module.apply_domain_priority(
+        mihomo, outbound, ("service.example.cn",), prioritize_dns=True,
+    )
+    module.apply_x_priority(mihomo, outbound, prioritize_dns=True)
+    assert mihomo["rules"][:4] == [
+        f"DOMAIN-SUFFIX,{domain},{outbound}" for domain in X_DOMAINS
+    ]
+    assert mihomo["rules"][4] == f"DOMAIN-SUFFIX,service.example.cn,{outbound}"
+    assert mihomo["rules"][-2:] == ["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"]
+    domain_direct = {
+        rule for rule in mihomo["rules"]
+        if rule.startswith(("DOMAIN,", "DOMAIN-SUFFIX,")) and rule.endswith(",DIRECT")
+    }
+    assert domain_direct == {
+        f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in ("localhost", "local", "lan", "home.arpa")
+    }
+    assert mihomo["rule-providers"] == {
+        "cn-ip": {
+            "type": "http", "behavior": "ipcidr", "format": "mrs", "interval": 86400,
+            "proxy": outbound,
+            "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs",
+            "path": "./ruleset/personal-vpn/cn-ip.mrs",
+        }
+    }
+    assert mihomo["dns"]["nameserver"] == [
+        f"https://1.1.1.1/dns-query#{outbound}",
+        f"https://9.9.9.9/dns-query#{outbound}",
+    ]
+    assert all(value.endswith("#DIRECT") for value in mihomo["dns"]["proxy-server-nameserver"])
+    foreign_policy_keys = {"+.service.example.cn"}
+    assert all(f"+.{domain}" not in mihomo["dns"]["nameserver-policy"] for domain in X_DOMAINS)
+    assert all(isinstance(value, str) and value.endswith("#DIRECT")
+               for key, value in mihomo["dns"]["nameserver-policy"].items()
+               if key not in foreign_policy_keys)
+    assert "+.cn" in mihomo["dns"]["nameserver-policy"]
+    assert all(
+        mihomo["dns"]["nameserver-policy"][key] == mihomo["dns"]["nameserver"]
+        for key in foreign_policy_keys
+    )
+    assert TEST_STATE["server"] not in json.dumps({
+        "rules": mihomo["rules"], "dns": mihomo["dns"],
+        "rule-providers": mihomo["rule-providers"],
+    })
+
+    cidrs = directory / "pure-cn-cidrs.txt"
+    cidrs.write_text("1.0.1.0/24\n# comment\n240e::/20\n1.0.1.0/24\n", encoding="utf-8")
+    inline = module.mainland_split(
+        module.global_profile(TEST_STATE, outbound), outbound, cn_cidrs=cidrs,
+    )
+    assert inline["rule-providers"] == {
+        "cn-ip": {
+            "type": "inline", "behavior": "ipcidr",
+            "payload": ["1.0.1.0/24", "240e::/20"],
+        }
+    }
+
+
 def check_client_generation(directory: Path) -> str:
     if os.name == "nt":
-        return "skipped on Windows because v1 enforces POSIX mode 0600 for private credentials"
+        return "private CLI skipped on Windows; dual-core pure generation passed"
 
     state = directory / "private-state.json"
     state.write_text(
         json.dumps(
             {
-                "kind": "ss",
-                "server": "192.0.2.10",
-                "port": 28447,
-                "method": "aes-128-gcm",
-                "password": "synthetic-smoke-test-only",
+                **TEST_STATE,
             }
         ),
         encoding="utf-8",
@@ -304,6 +439,22 @@ def check_client_generation(directory: Path) -> str:
     assert x_profile["rules"][:4] == x_rules
     assert x_profile["rules"][4:] == profile["rules"], "X mode changed non-X mobile rules"
 
+    existing = directory / "existing-rules-domain.yaml"
+    generated = run(
+        "client_config.py",
+        "--base", phone,
+        "--output", existing,
+        "--mode", "existing-rules",
+        "--name", "个人VPN·固定出口",
+        "--domain", "service.example.cn",
+    )
+    expect_success(generated, "existing-rules DNS preservation")
+    existing_profile = load_yaml_or_json(existing)
+    assert existing_profile["rules"][0] == (
+        "DOMAIN-SUFFIX,service.example.cn,个人VPN·固定出口"
+    )
+    assert existing_profile["dns"] == profile["dns"], "existing-rules rewrote existing DNS"
+
     desktop = directory / "desktop-x.yaml"
     generated = run(
         "client_config.py",
@@ -316,7 +467,7 @@ def check_client_generation(directory: Path) -> str:
     desktop_profile = load_yaml_or_json(desktop)
     assert desktop_profile["rules"][:4] == x_rules
     assert desktop_profile["rules"][-1] == "MATCH,DIRECT"
-    return "passed"
+    return "private CLI and dual-core pure generation passed"
 
 
 def main() -> int:
@@ -342,11 +493,13 @@ def main() -> int:
         directory = Path(temporary)
         check_single_exit_logic(directory)
         check_order_state(directory)
+        check_dual_core_generation(directory)
         client_result = check_client_generation(directory)
     print("PASS: package layout, catalog recommendation, legacy ID and ready order state")
     print("PASS: X intent adds four prioritized, de-duplicated rules and preserves other routes")
     print("PASS: single-exit generation excludes unrelated nodes, chains and providers")
-    print(f"Classic Android and desktop X profiles: {client_result}")
+    print("PASS: classic and Mihomo mobile profiles enforce their DNS and mainland-IP contracts")
+    print(f"Private CLI profiles: {client_result}")
     print("No network, SSH, VPN or system-proxy action was performed.")
     return 0
 

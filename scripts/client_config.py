@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import stat
@@ -14,6 +15,21 @@ try:
     import yaml
 except ImportError:  # pragma: no cover
     yaml = None
+
+
+LOCAL_DOMAINS = ("localhost", "local", "lan", "home.arpa")
+LOCAL_V4 = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32")
+LOCAL_V6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
+DOMESTIC_DNS_SUFFIXES = (
+    "cn", "baidu.com", "bdstatic.com", "qq.com", "weixin.com", "taobao.com", "tmall.com",
+    "alipay.com", "jd.com", "360buyimg.com", "bilibili.com", "bilivideo.com", "hdslb.com",
+    "163.com", "126.com", "meituan.com", "dianping.com", "douyin.com", "toutiao.com",
+    "zhihu.com", "zhimg.com", "weibo.com", "amap.com", "autonavi.com", "ctrip.com",
+)
+CLASSIC_DOMESTIC_DOH = ("https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query")
+MIHOMO_DOMESTIC_DOH = tuple(f"{server}#DIRECT" for server in CLASSIC_DOMESTIC_DOH)
+FOREIGN_DNS_TARGETS = ("1.1.1.1:53", "9.9.9.9:53")
 
 
 def private_state(path: Path) -> dict:
@@ -119,24 +135,62 @@ def read_reference_profile(source: Path) -> dict:
     return profile
 
 
-def classic_domestic_rules(source: Path | None) -> list[str]:
+def valid_dns_suffix(value: str) -> str | None:
+    suffix = value.strip().lower().rstrip(".")
+    if not suffix or suffix.startswith(("+.", ".")) or len(suffix) > 253:
+        return None
+    try:
+        ascii_suffix = suffix.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    labels = ascii_suffix.split(".")
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+           or not all(character.isalnum() or character == "-" for character in label)
+           for label in labels):
+        return None
+    return ascii_suffix
+
+
+def classic_domestic_dns_hints(source: Path | None) -> list[tuple[str, str]]:
+    hints = [("DOMAIN-SUFFIX", suffix) for suffix in DOMESTIC_DNS_SUFFIXES]
     if not source:
-        return [f"DOMAIN-SUFFIX,{d},DIRECT" for d in
-                ("baidu.com", "qq.com", "taobao.com", "tmall.com", "alipay.com", "jd.com", "bilibili.com")]
+        return hints
     rules = read_reference_profile(source).get("rules", [])
-    parsed = [r.split(",") for r in rules if isinstance(r, str)]
-    domestic = {r[2] for r in parsed if len(r) >= 3 and r[:2] == ["GEOIP", "CN"]}
+    parsed = [[part.strip() for part in rule.split(",")]
+              for rule in rules if isinstance(rule, str)]
+    domestic = {rule[2] for rule in parsed if len(rule) == 3
+                and rule[0].upper() == "GEOIP" and rule[1].upper() == "CN"}
     if len(domestic) != 1:
         raise SystemExit("expected an unambiguous GEOIP,CN policy in the reference profile")
-    # Only named domestic groups identify a curated list. DIRECT may also cover
-    # unrelated service exceptions (or work hosts) in a personal profile.
     if domestic == {"DIRECT"}:
         raise SystemExit("reference uses general DIRECT; omit --classic-rules-from or use a named domestic group")
-    return list(dict.fromkeys(
-        f"{r[0]},{r[1]},DIRECT" for r in parsed if len(r) == 3
-        and r[0] in ("DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6")
-        and r[2] in domestic
-    ))
+    for rule in parsed:
+        kind = rule[0].upper() if rule else ""
+        suffix = valid_dns_suffix(rule[1]) if len(rule) == 3 else None
+        if kind in ("DOMAIN", "DOMAIN-SUFFIX") and suffix and rule[2] in domestic:
+            hints.append((kind, suffix))
+    return list(dict.fromkeys(hints))
+
+
+def read_cn_cidrs(source: Path) -> list[str]:
+    payload = []
+    for number, raw in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+        value = raw.strip()
+        if not value or value.startswith("#"):
+            continue
+        if "/" not in value:
+            raise SystemExit(f"--cn-cidrs line {number} is not a CIDR prefix")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            raise SystemExit(f"--cn-cidrs line {number} is not a canonical CIDR prefix") from None
+        if network.prefixlen == 0:
+            raise SystemExit(f"--cn-cidrs line {number} is a default route and would bypass the foreign outbound")
+        payload.append(str(network))
+    payload = list(dict.fromkeys(payload))
+    if not payload:
+        raise SystemExit("--cn-cidrs must contain at least one CIDR prefix")
+    return payload
 
 
 def classic_relay_chains(profile: dict) -> None:
@@ -192,57 +246,154 @@ def classic_relay_chains(profile: dict) -> None:
         experimental["udp-fallback-match"] = False
 
 
-def mainland_split(profile: dict, outbound: str, classic: bool = False, rules_from: Path | None = None) -> dict:
+def classic_outbound_server_hosts(profile: dict, outbound: str) -> list[str]:
+    proxies = {item.get("name"): item for item in profile.get("proxies", []) if isinstance(item, dict)}
+    groups = {item.get("name"): item for item in profile.get("proxy-groups", []) if isinstance(item, dict)}
+    pending = [outbound]
+    visited = set()
+    hostnames = []
+    while pending:
+        name = pending.pop()
+        if name in visited or name in ("DIRECT", "REJECT"):
+            continue
+        visited.add(name)
+        if name in groups:
+            group = groups[name]
+            if group.get("use"):
+                raise SystemExit(
+                    "classic outbound groups using dynamic proxy providers cannot be safely bootstrapped; "
+                    "select one owned literal node with --only-node or replace provider use with explicit proxies"
+                )
+            members = group.get("proxies")
+            if not isinstance(members, list) or not members or not all(isinstance(item, str) for item in members):
+                raise SystemExit("classic outbound groups must contain explicit proxy names")
+            pending.extend(members)
+            continue
+        node = proxies.get(name)
+        if not node:
+            raise SystemExit(f"classic outbound dependency {name!r} does not exist")
+        server = node.get("server")
+        try:
+            ipaddress.ip_address(server)
+        except (TypeError, ValueError):
+            hostname = valid_dns_suffix(server) if isinstance(server, str) else None
+            if not hostname or "." not in hostname:
+                raise SystemExit("classic outbound proxy servers must be an IP address or valid hostname")
+            hostnames.append(hostname)
+    return list(dict.fromkeys(hostnames))
+
+
+def classic_dns_tunnel_ports(profile: dict) -> tuple[int, int]:
+    occupied = set()
+    for key in ("port", "socks-port", "redir-port", "tproxy-port", "mixed-port"):
+        if type(profile.get(key)) is int:
+            occupied.add(profile[key])
+    dns_listen = profile.get("dns", {}).get("listen") if isinstance(profile.get("dns"), dict) else None
+    local_addresses = [dns_listen, profile.get("external-controller")]
+    for tunnel in profile.get("tunnels", []):
+        if isinstance(tunnel, dict):
+            local_addresses.append(tunnel.get("address"))
+        elif isinstance(tunnel, str):
+            parts = [part.strip() for part in tunnel.split(",")]
+            if len(parts) >= 2:
+                local_addresses.append(parts[1])
+    for address in local_addresses:
+        if not isinstance(address, str):
+            continue
+        try:
+            occupied.add(int(address.rsplit(":", 1)[1]))
+        except (IndexError, ValueError):
+            pass
+    selected = []
+    candidate = 16553
+    while len(selected) < 2:
+        if candidate not in occupied:
+            selected.append(candidate)
+        candidate += 1
+    return selected[0], selected[1]
+
+
+def fresh_dns(profile: dict) -> dict:
+    current = profile.get("dns")
+    if not isinstance(current, dict):
+        raise SystemExit("phone profile must contain a dns mapping; generate a new profile or add DNS settings")
+    ipv6 = current.get("ipv6", False)
+    if not isinstance(ipv6, bool):
+        raise SystemExit("phone profile dns.ipv6 must be true or false")
+    rebuilt = {
+        "enable": True,
+        "listen": current.get("listen", "127.0.0.1:1053"),
+        "ipv6": ipv6,
+        "enhanced-mode": "fake-ip",
+        "fake-ip-range": current.get("fake-ip-range", "198.18.0.1/16"),
+        "use-system-hosts": False,
+        "use-hosts": bool(profile.get("hosts")),
+    }
+    if ipv6 and isinstance(current.get("fake-ip-range6"), str):
+        rebuilt["fake-ip-range6"] = current["fake-ip-range6"]
+    return rebuilt
+
+
+def mainland_split(profile: dict, outbound: str, classic: bool = False,
+                   rules_from: Path | None = None, cn_cidrs: Path | None = None) -> dict:
     """Apply mainland routing to a dedicated all-traffic Mihomo phone profile."""
     if profile.get("rules") != [f"MATCH,{outbound}"] or not profile.get("tun", {}).get("enable"):
         raise SystemExit("expected a full-tunnel phone profile with a single MATCH to the selected outbound")
     if profile.get("rule-providers") or any(profile.get(k) for k in ("sub-rules", "listeners")):
         raise SystemExit("this profile has custom routing; merge its rules explicitly")
-    local_domains = ("localhost", "local", "lan", "home.arpa")
-    local_v4 = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32")
-    local_v6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
     profile["mode"] = "rule"
     profile["rules"] = [
-        *(f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in local_domains),
-        *(f"IP-CIDR,{cidr},DIRECT,no-resolve" for cidr in local_v4),
-        *(f"IP-CIDR6,{cidr},DIRECT,no-resolve" for cidr in local_v6),
-        "DOMAIN-SUFFIX,cn,DIRECT",
+        *(f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in LOCAL_DOMAINS),
+        *(f"IP-CIDR,{cidr},DIRECT,no-resolve" for cidr in LOCAL_V4),
+        *(f"IP-CIDR6,{cidr},DIRECT,no-resolve" for cidr in LOCAL_V6),
     ]
-    dns = profile.get("dns")
-    if not isinstance(dns, dict):
-        raise SystemExit("phone profile must contain a dns mapping; generate a new profile or add DNS settings")
+    dns = fresh_dns(profile)
+    profile["dns"] = dns
     if classic:
+        if cn_cidrs:
+            raise SystemExit("--cn-cidrs is only supported by the Mihomo mobile-cn-split profile")
         classic_relay_chains(profile)
-        domestic = classic_domestic_rules(rules_from)
-        profile["rules"] = list(dict.fromkeys(profile["rules"] + domestic))
+        bootstrap_hosts = classic_outbound_server_hosts(profile, outbound)
         profile["rules"].extend(["GEOIP,CN,DIRECT", f"MATCH,{outbound}"])
-        local_doh = "https://223.5.5.5/dns-query"
-        dns["nameserver"] = [local_doh, "https://223.6.6.6/dns-query"]
-        dns["fallback"] = ["https://1.1.1.1/dns-query", "https://9.9.9.9/dns-query"]
-        dns["fallback-filter"] = {"geoip": True, "geoip-code": "CN"}
-        dns["nameserver-policy"] = {"+.cn": local_doh}
-        for rule in domestic:
-            typ, domain, _ = rule.split(",")
-            if typ not in ("DOMAIN", "DOMAIN-SUFFIX"):
-                continue
-            dns["nameserver-policy"][("+." if typ == "DOMAIN-SUFFIX" else "") + domain] = local_doh
+        ports = classic_dns_tunnel_ports(profile)
+        existing_tunnels = profile.get("tunnels", [])
+        if not isinstance(existing_tunnels, list):
+            raise SystemExit("classic tunnels setting must be a list")
+        profile["tunnels"] = list(existing_tunnels) + [
+            {"network": ["tcp"], "address": f"127.0.0.1:{port}",
+             "target": target, "proxy": outbound}
+            for port, target in zip(ports, FOREIGN_DNS_TARGETS)
+        ]
+        cfa = profile.setdefault("clash-for-android", {})
+        if not isinstance(cfa, dict):
+            raise SystemExit("clash-for-android setting must be a mapping")
+        cfa["append-system-dns"] = False
+        dns["nameserver"] = [f"tcp://127.0.0.1:{port}" for port in ports]
+        hints = [hint for hint in classic_domestic_dns_hints(rules_from)
+                 if hint[1] not in X_DOMAINS]
+        dns["nameserver-policy"] = {
+            ("+." if kind == "DOMAIN-SUFFIX" else "") + suffix:
+                CLASSIC_DOMESTIC_DOH[index % len(CLASSIC_DOMESTIC_DOH)]
+            for index, (kind, suffix) in enumerate(hints)
+        }
+        for index, hostname in enumerate(bootstrap_hosts):
+            dns["nameserver-policy"][hostname] = CLASSIC_DOMESTIC_DOH[index % len(CLASSIC_DOMESTIC_DOH)]
         return profile
     base_url = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo"
-    profile["rule-providers"] = {
-        key: {
-            "type": "http", "behavior": behavior, "format": "mrs", "interval": 86400,
-            "proxy": outbound, "url": f"{base_url}/{category}/cn.mrs",
-            "path": f"./ruleset/personal-vpn/{key}.mrs",
+    if cn_cidrs:
+        cn_provider = {"type": "inline", "behavior": "ipcidr", "payload": read_cn_cidrs(cn_cidrs)}
+    else:
+        cn_provider = {
+            "type": "http", "behavior": "ipcidr", "format": "mrs", "interval": 86400,
+            "proxy": outbound, "url": f"{base_url}/geoip/cn.mrs",
+            "path": "./ruleset/personal-vpn/cn-ip.mrs",
         }
-        for key, behavior, category in (("cn-domains", "domain", "geosite"), ("cn-ip", "ipcidr", "geoip"))
-    }
-    profile["rules"].extend(["RULE-SET,cn-domains,DIRECT", "RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"])
-    domestic_dns = ["https://223.5.5.5/dns-query#DIRECT", "https://223.6.6.6/dns-query#DIRECT"]
-    dns["proxy-server-nameserver"] = domestic_dns.copy()
+    profile["rule-providers"] = {"cn-ip": cn_provider}
+    profile["rules"].extend(["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"])
+    dns["proxy-server-nameserver"] = list(MIHOMO_DOMESTIC_DOH)
     dns["nameserver-policy"] = {
-        **{f"+.{d}": "system" for d in local_domains},
-        "+.cn": domestic_dns[0], "rule-set:cn-domains": domestic_dns[0],
+        f"+.{suffix}": MIHOMO_DOMESTIC_DOH[index % len(MIHOMO_DOMESTIC_DOH)]
+        for index, suffix in enumerate(DOMESTIC_DNS_SUFFIXES)
     }
     dns["nameserver"] = [f"https://1.1.1.1/dns-query#{outbound}", f"https://9.9.9.9/dns-query#{outbound}"]
     return profile
@@ -251,7 +402,8 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False, rules_fr
 X_DOMAINS = ("twimg.com", "x.com", "twitter.com", "t.co")
 
 
-def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...]) -> dict:
+def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...],
+                          prioritize_dns: bool = False) -> dict:
     """Place explicitly requested service suffixes ahead of DNS-dependent rules."""
     selected = dict.fromkeys(domains)
 
@@ -262,11 +414,40 @@ def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...]
 
     priority = [f"DOMAIN-SUFFIX,{domain},{outbound}" for domain in selected]
     profile["rules"] = priority + [rule for rule in profile["rules"] if not is_selected_suffix(rule)]
+    dns = profile.get("dns")
+    policy = dns.get("nameserver-policy") if isinstance(dns, dict) else None
+    nameservers = dns.get("nameserver") if isinstance(dns, dict) else None
+    if prioritize_dns and isinstance(policy, dict) and isinstance(nameservers, list) and nameservers:
+        foreign_dns = nameservers[0]
+        if not isinstance(foreign_dns, str):
+            raise SystemExit("mobile-cn-split requires a string foreign DNS upstream")
+        proxy_hosts = set()
+        for node in profile.get("proxies", []):
+            server = node.get("server") if isinstance(node, dict) else None
+            host = valid_dns_suffix(server) if isinstance(server, str) else None
+            if host:
+                proxy_hosts.add(host)
+        for matcher in list(policy):
+            policy_domain = matcher.removeprefix("+.").lower().rstrip(".")
+            if not matcher.startswith("+.") and policy_domain in proxy_hosts:
+                continue
+            if any(domain == policy_domain or policy_domain.endswith("." + domain)
+                   for domain in selected):
+                del policy[matcher]
+        # A specific policy is needed only below a broader domestic suffix.
+        # Other services inherit the full pair of default foreign resolvers.
+        parent_suffixes = tuple(key[2:] for key in policy if key.startswith("+."))
+        for domain in selected:
+            if any(domain.endswith("." + parent) for parent in parent_suffixes):
+                # In classic Clash "+.name" also writes the exact trie entry.
+                # Preserve an endpoint's exact bootstrap while routing its children.
+                matcher = ("." if domain in proxy_hosts else "+.") + domain
+                policy[matcher] = list(nameservers) if profile.get("rule-providers") else foreign_dns
     return profile
 
 
-def apply_x_priority(profile: dict, outbound: str) -> dict:
-    return apply_domain_priority(profile, outbound, X_DOMAINS)
+def apply_x_priority(profile: dict, outbound: str, prioritize_dns: bool = False) -> dict:
+    return apply_domain_priority(profile, outbound, X_DOMAINS, prioritize_dns)
 
 
 def desktop_profile(state: dict, name: str, domains: list[str], base: Path | None,
@@ -315,29 +496,33 @@ def main() -> None:
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
-    p.add_argument("--classic-android", action="store_true", help="inline domain rules and GEOIP for classic Clash for Android")
-    p.add_argument("--classic-rules-from", type=Path, help="optional known-working profile with a named Chinese domestic group")
+    p.add_argument("--classic-android", action="store_true", help="use classic Clash DNS tunnels and mainland GeoIP routing")
+    p.add_argument("--classic-rules-from", type=Path, help="read domestic DNS hints from a named mainland group in a trusted local profile")
+    p.add_argument("--cn-cidrs", type=Path,
+                   help="trusted local CIDR text file for an offline Mihomo cn-ip provider")
     args = p.parse_args()
     if os.name == "nt":
         p.error("Generate private profiles in WSL. Keep the order, keys and YML inside the Linux filesystem.")
     if (args.classic_android and args.mode != "mobile-cn-split") or (args.classic_rules_from and not args.classic_android):
         p.error("--classic-rules-from requires --classic-android with --mode mobile-cn-split")
+    if args.cn_cidrs and (args.mode != "mobile-cn-split" or args.classic_android):
+        p.error("--cn-cidrs requires Mihomo --mode mobile-cn-split without --classic-android")
     if args.only_node is not None and (not args.only_node.strip() or args.mode not in ("mobile-cn-split", "mobile-global")
                            or not args.base or args.state or args.base_default):
         p.error("--only-node needs --base with mobile-cn-split or mobile-global, without --state")
-    if any(path and args.output.resolve() == path.resolve() for path in (args.state, args.base, args.classic_rules_from)):
+    if any(path and args.output.resolve() == path.resolve()
+           for path in (args.state, args.base, args.classic_rules_from, args.cn_cidrs)):
         p.error("output must differ from the private state and existing base profile")
     if args.only_node is not None:
         state = direct_ss_state_from_profile(read_reference_profile(args.base), args.only_node)
         profile = global_profile(state, args.name)
         if args.mode == "mobile-cn-split":
-            profile = mainland_split(profile, args.name, args.classic_android, args.classic_rules_from)
+            profile = mainland_split(profile, args.name, args.classic_android,
+                                     args.classic_rules_from, args.cn_cidrs)
     elif args.mode == "existing-rules":
         if not (args.use_x or args.domain) or not args.base or args.state or args.base_default:
             p.error("existing-rules needs --use-x or --domain, --base, and an existing --name")
-        if yaml is None:
-            p.error("reading an existing YAML profile requires PyYAML")
-        profile = yaml.safe_load(args.base.read_bytes())
+        profile = read_reference_profile(args.base)
         if (not isinstance(profile, dict) or str(profile.get("mode", "rule")).lower() != "rule"
                 or not isinstance(profile.get("rules"), list)
                 or not all(isinstance(rule, str) for rule in profile["rules"])):
@@ -350,7 +535,8 @@ def main() -> None:
         profile = yaml.safe_load(args.base.read_bytes())
         if args.name not in {item["name"] for item in profile.get("proxy-groups", [])}:
             p.error("--name must identify the original phone proxy group")
-        profile = mainland_split(profile, args.name, args.classic_android, args.classic_rules_from)
+        profile = mainland_split(profile, args.name, args.classic_android,
+                                 args.classic_rules_from, args.cn_cidrs)
     else:
         if not args.state:
             p.error("--state is required for a new profile")
@@ -364,11 +550,12 @@ def main() -> None:
                 p.error("--base is supported for desktop-domains and mobile-cn-split")
             profile = global_profile(state, args.name)
             if args.mode == "mobile-cn-split":
-                profile = mainland_split(profile, args.name, args.classic_android, args.classic_rules_from)
+                profile = mainland_split(profile, args.name, args.classic_android,
+                                         args.classic_rules_from, args.cn_cidrs)
     if args.domain and args.mode != "desktop-domains":
-        apply_domain_priority(profile, args.name, tuple(args.domain))
+        apply_domain_priority(profile, args.name, tuple(args.domain), args.mode == "mobile-cn-split")
     if args.use_x:
-        apply_x_priority(profile, args.name)
+        apply_x_priority(profile, args.name, args.mode == "mobile-cn-split")
     if yaml is None:
         content = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
     else:
