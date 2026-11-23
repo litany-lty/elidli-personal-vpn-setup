@@ -34,6 +34,16 @@ TEST_STATE = {
     "method": "aes-128-gcm",
     "password": "synthetic-smoke-test-only",
 }
+TEST_HY2_STATE = {
+    "kind": "hysteria2",
+    "server": "192.0.2.10",
+    "port": 28448,
+    "password": "synthetic-hy2-smoke-test-only",
+    "sni": "www.bing.com",
+    "fingerprint": "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+    "up": "30 mbps",
+    "down": "150 mbps",
+}
 
 
 def run(script: str, *arguments: object) -> subprocess.CompletedProcess[str]:
@@ -470,6 +480,70 @@ def check_client_generation(directory: Path) -> str:
     return "private CLI and dual-core pure generation passed"
 
 
+def check_hysteria2_and_deploy_plan(directory: Path) -> None:
+    """Verify Hysteria2 Mihomo profiles, classic Clash boundary, --only-node, and offline deploy plan."""
+    plan_res = run(
+        "deploy.py", "plan", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+        "--service-id", "personal-hy2", "--protocol", "hysteria2",
+    )
+    expect_success(plan_res, "hysteria2 deploy plan")
+    plan_data = json.loads(plan_res.stdout)
+    assert plan_data["protocol"] == "hysteria2"
+    assert plan_data["port"] == 28448
+    assert plan_data["sni"] == "www.bing.com"
+    assert plan_data["up_mbps"] == 15 and plan_data["down_mbps"] == 50
+
+    module = load_client_module("elidli_hy2_test")
+    outbound = "Personal Hy2 exit"
+    hy2_global = module.global_profile(TEST_HY2_STATE, outbound)
+    node = hy2_global["proxies"][0]
+    assert node["type"] == "hysteria2"
+    assert node["port"] == 28448
+    assert node["fingerprint"] == TEST_HY2_STATE["fingerprint"]
+    assert node["skip-cert-verify"] is True
+    assert node["up"] == "30 mbps" and node["down"] == "150 mbps" and node["udp"] is True
+
+    hy2_mihomo = module.mainland_split(hy2_global, outbound)
+    module.apply_x_priority(hy2_mihomo, outbound, prioritize_dns=True)
+    assert hy2_mihomo["rules"][:4] == [f"DOMAIN-SUFFIX,{d},{outbound}" for d in X_DOMAINS]
+    assert hy2_mihomo["rules"][-2:] == ["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"]
+
+    mixed_source = {
+        "proxies": [
+            node | {"name": "Own Hy2"},
+            {"name": "dead free node", "type": "vmess", "server": "192.0.2.99", "port": 443, "uuid": "DEAD-SENTINEL"},
+        ],
+        "proxy-groups": [{"name": "Select", "type": "select", "proxies": ["Own Hy2", "dead free node"]}],
+        "rules": ["MATCH,Select"],
+    }
+    extracted = module.direct_node_state_from_profile(mixed_source, "Own Hy2", allow_hysteria2=True)
+    assert extracted["kind"] == "hysteria2" and extracted["fingerprint"] == TEST_HY2_STATE["fingerprint"]
+    try:
+        module.direct_node_state_from_profile(mixed_source, "Own Hy2", allow_hysteria2=False)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("classic Clash boundary failed to reject Hysteria2 --only-node")
+
+    if os.name != "nt":
+        hy2_state = directory / "hy2-state.json"
+        hy2_state.write_text(json.dumps(TEST_HY2_STATE), encoding="utf-8")
+        os.chmod(hy2_state, 0o600)
+        hy2_out = directory / "phone-hy2.yaml"
+        expect_success(
+            run("client_config.py", "--state", hy2_state, "--output", hy2_out, "--mode", "mobile-cn-split", "--use-x"),
+            "Mihomo Hysteria2 CLI generation",
+        )
+        written = load_yaml_or_json(hy2_out)
+        assert written["proxies"][0]["type"] == "hysteria2"
+        assert written["proxies"][0]["fingerprint"] == TEST_HY2_STATE["fingerprint"]
+        rejected = run(
+            "client_config.py", "--state", hy2_state, "--output", directory / "bad-classic.yaml",
+            "--mode", "mobile-cn-split", "--classic-android",
+        )
+        assert rejected.returncode != 0, "classic-android accepted hysteria2 state"
+
+
 def main() -> int:
     required = (
         "SKILL.md", "README.md", "LICENSE", "references/data-sources.md",
@@ -494,11 +568,13 @@ def main() -> int:
         check_single_exit_logic(directory)
         check_order_state(directory)
         check_dual_core_generation(directory)
+        check_hysteria2_and_deploy_plan(directory)
         client_result = check_client_generation(directory)
     print("PASS: package layout, catalog recommendation, legacy ID and ready order state")
     print("PASS: X intent adds four prioritized, de-duplicated rules and preserves other routes")
     print("PASS: single-exit generation excludes unrelated nodes, chains and providers")
     print("PASS: classic and Mihomo mobile profiles enforce their DNS and mainland-IP contracts")
+    print("PASS: Hysteria2 parallel plan, Mihomo profile pinning and classic-core guardrails")
     print(f"Private CLI profiles: {client_result}")
     print("No network, SSH, VPN or system-proxy action was performed.")
     return 0

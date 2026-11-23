@@ -60,8 +60,24 @@ def proxy_node(state: dict, name: str) -> dict:
     common = {"name": name, "server": state["server"], "port": state["port"]}
     if kind == "ss":
         return common | {"type": "ss", "cipher": state["method"], "password": state["password"], "udp": True}
+    if kind == "hysteria2":
+        for key in ("password", "sni", "fingerprint"):
+            if not isinstance(state.get(key), str) or not state[key].strip():
+                raise SystemExit(f"private hysteria2 spec is missing {key}")
+        node = common | {
+            "type": "hysteria2",
+            "password": state["password"],
+            "sni": state["sni"].strip(),
+            "skip-cert-verify": bool(state.get("skip_cert_verify", True)),
+            "fingerprint": state["fingerprint"].strip(),
+            "udp": True,
+        }
+        for bw_key in ("up", "down"):
+            if isinstance(state.get(bw_key), str) and state[bw_key].strip():
+                node[bw_key] = state[bw_key].strip()
+        return node
     if kind not in ("socks5", "http"):
-        raise SystemExit("private proxy spec kind must be ss, socks5, or http")
+        raise SystemExit("private proxy spec kind must be ss, hysteria2, socks5, or http")
     for key in ("username", "password"):
         if key not in state:
             raise SystemExit(f"private proxy spec is missing {key}")
@@ -87,8 +103,8 @@ def global_profile(state: dict, name: str) -> dict:
     }
 
 
-def direct_ss_state_from_profile(profile: dict, node_name: str) -> dict:
-    """Extract one self-contained Shadowsocks node from parsed profile data."""
+def direct_node_state_from_profile(profile: dict, node_name: str, *, allow_hysteria2: bool = True) -> dict:
+    """Extract one self-contained direct Shadowsocks or Hysteria2 node from parsed profile data."""
     if not isinstance(profile, dict) or not isinstance(profile.get("proxies"), list):
         raise SystemExit("the base profile must contain a proxies list")
     matches = [node for node in profile["proxies"]
@@ -99,8 +115,34 @@ def direct_ss_state_from_profile(profile: dict, node_name: str) -> dict:
            for group in profile.get("proxy-groups", [])):
         raise SystemExit("--only-node is ambiguous because a proxy group has the same name")
     node = matches[0]
-    if node.get("type") != "ss":
-        raise SystemExit("--only-node currently supports a direct Shadowsocks node")
+    ntype = node.get("type")
+    if ntype == "hysteria2":
+        if not allow_hysteria2:
+            raise SystemExit("Hysteria2 requires Mihomo (Clash Meta); classic Clash only supports direct Shadowsocks here")
+        supported = {"name", "type", "server", "port", "password", "sni", "skip-cert-verify", "fingerprint", "up", "down", "udp"}
+        unsupported = set(node) - supported
+        if unsupported:
+            raise SystemExit("the selected node has unsupported dependencies or transport fields: "
+                             + ", ".join(sorted(unsupported)))
+        if (not isinstance(node.get("server"), str) or not node["server"].strip()
+                or type(node.get("port")) is not int or not 1 <= node["port"] <= 65535
+                or any(not isinstance(node.get(key), str) or not node[key].strip()
+                       for key in ("password", "sni", "fingerprint"))):
+            raise SystemExit("the selected Hysteria2 node requires server, port, password, sni and pinned fingerprint")
+        if node.get("udp") is False:
+            raise SystemExit("the selected Hysteria2 node must support UDP")
+        extracted = {
+            "kind": "hysteria2", "server": node["server"], "port": node["port"],
+            "password": node["password"], "sni": node["sni"],
+            "skip_cert_verify": bool(node.get("skip-cert-verify", True)),
+            "fingerprint": node["fingerprint"],
+        }
+        for bw_key in ("up", "down"):
+            if isinstance(node.get(bw_key), str) and node[bw_key].strip():
+                extracted[bw_key] = node[bw_key].strip()
+        return extracted
+    if ntype != "ss":
+        raise SystemExit("--only-node supports a direct Shadowsocks or Mihomo Hysteria2 node")
     supported = {"name", "type", "server", "port", "cipher", "password", "udp"}
     unsupported = set(node) - supported
     if unsupported:
@@ -116,6 +158,11 @@ def direct_ss_state_from_profile(profile: dict, node_name: str) -> dict:
         "kind": "ss", "server": node["server"], "port": node["port"],
         "method": node["cipher"], "password": node["password"],
     }
+
+
+def direct_ss_state_from_profile(profile: dict, node_name: str) -> dict:
+    """Backward-compatible helper enforcing a direct Shadowsocks node."""
+    return direct_node_state_from_profile(profile, node_name, allow_hysteria2=False)
 
 
 def read_reference_profile(source: Path) -> dict:
@@ -500,7 +547,7 @@ def main() -> None:
     p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
     p.add_argument("--base", type=Path, help="existing YAML used only by the selected mode")
-    p.add_argument("--only-node", help="exact direct Shadowsocks node to extract from --base")
+    p.add_argument("--only-node", help="exact direct Shadowsocks or Hysteria2 node to extract from --base")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
@@ -522,7 +569,9 @@ def main() -> None:
            for path in (args.state, args.base, args.classic_rules_from, args.cn_cidrs)):
         p.error("output must differ from the private state and existing base profile")
     if args.only_node is not None:
-        state = direct_ss_state_from_profile(read_reference_profile(args.base), args.only_node)
+        state = direct_node_state_from_profile(
+            read_reference_profile(args.base), args.only_node, allow_hysteria2=not args.classic_android
+        )
         profile = global_profile(state, args.name)
         if args.mode == "mobile-cn-split":
             profile = mainland_split(profile, args.name, args.classic_android,
@@ -549,6 +598,8 @@ def main() -> None:
         if not args.state:
             p.error("--state is required for a new profile")
         state = private_state(args.state)
+        if args.classic_android and state.get("kind") == "hysteria2":
+            p.error("Hysteria2 requires Mihomo (Clash Meta); omit --classic-android or use a Shadowsocks state")
         if args.mode == "desktop-domains":
             if not (args.domain or args.use_x):
                 p.error("desktop-domains requires --use-x or at least one --domain")
