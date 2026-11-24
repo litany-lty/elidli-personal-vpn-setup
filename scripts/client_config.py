@@ -23,30 +23,41 @@ LOCAL_V4 = ("0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.
             "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32")
 LOCAL_V6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
 DOMESTIC_DNS_SUFFIXES = (
-    "cn", "baidu.com", "bdstatic.com", "bdimg.com",
-    "qq.com", "weixin.com", "wechat.com", "servicewechat.com", "gtimg.com", "tenpay.com",
+    "cn", "baidu.com", "bdstatic.com", "bdimg.com", "baidustatic.com", "bdydns.com", "baidupcs.com",
+    "qq.com", "weixin.com", "wechat.com", "servicewechat.com", "gtimg.com", "tenpay.com", "myapp.com",
     "tencent-cloud.net", "myqcloud.com", "qcloud.com",
-    "taobao.com", "tmall.com", "alipay.com", "alipayobjects.com",
+    "taobao.com", "tmall.com", "alipay.com", "alipayobjects.com", "cainiao.com", "mmstat.com",
     "aliyun.com", "aliyuncs.com", "alicdn.com",
     "jd.com", "jdcloud.com", "360buyimg.com",
-    "bilibili.com", "bilivideo.com", "hdslb.com", "biliapi.net", "biliapi.com",
+    "bilibili.com", "bilivideo.com", "hdslb.com", "biliapi.net", "biliapi.com", "acgvideo.com", "biligame.com",
     "163.com", "126.com", "126.net", "163yun.com",
-    "meituan.com", "meituan.net", "dianping.com", "sankuai.com",
+    "meituan.com", "meituan.net", "dianping.com", "sankuai.com", "dpfile.com",
     "douyin.com", "douyinvod.com", "douyinpic.com", "toutiao.com", "byteimg.com", "snssdk.com",
-    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "gifshow.com",
-    "pinduoduo.com", "yangkeduo.com", "pddpic.com",
+    "bytegoofy.com", "bytetos.com", "bytescm.com", "ecombdimg.com", "zjcdn.com", "volccdn.com",
+    "feishu.cn", "larkoffice.com", "larksuite.com",
+    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "gifshow.com", "kuaishouzt.com", "yximgs.com",
+    "pinduoduo.com", "yangkeduo.com", "pddpic.com", "dewucdn.com", "poizon.com",
+    "taptap.com", "tapimg.com",
     "xiaomi.com", "mi.com", "miui.com", "mi-img.com", "xiaomixiaoai.com",
+    "oppomobile.com", "hihonorcloud.com", "dbankcloud.com", "dbankcdn.com",
+    "cmbchina.com", "cmbimg.com", "pingan.com", "ccb.com", "umetrip.com", "variflight.com", "12306.cn",
+    "10010.com", "chinamobile.com", "cmpassport.com",
+    "geetest.com", "umeng.com", "umengcloud.com",
+    "doubao.com", "deepseek.com", "minimaxi.com", "kimi.com",
     "sandai.net", "xunlei.com",
     "zhihu.com", "zhimg.com", "weibo.com", "amap.com", "autonavi.com", "ctrip.com", "qunar.com",
 )
 FAKE_IP_FILTER = (
-    "*.lan", "*.local", "*.arpa", "time.*.com", "ntp.*.com",
-    "localhost.ptlogin2.qq.com", "*.msftncsi.com", "www.msftconnecttest.com",
+    "*.lan", "*.local", "*.arpa", "time.*.com", "time.*.apple.com", "ntp.*.com", "+.pool.ntp.org",
+    "stun.*.*", "stun.*.*.*", "captive.apple.com",
+    "localhost.ptlogin2.qq.com", "localhost.sec.qq.com", "*.msftncsi.com", "www.msftconnecttest.com",
     "+.market.xiaomi.com", "+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xunlei.com",
 )
 CLASSIC_DOMESTIC_DOH = ("https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query")
 MIHOMO_DOMESTIC_DOH = tuple(f"{server}#DIRECT" for server in CLASSIC_DOMESTIC_DOH)
 FOREIGN_DNS_TARGETS = ("1.1.1.1:53", "9.9.9.9:53")
+QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
+MIHOMO_TOP_KEYS = ("unified-delay", "tcp-concurrent", "keep-alive-interval", "find-process-mode")
 
 
 def private_state(path: Path) -> dict:
@@ -158,20 +169,47 @@ def proxy_node(state: dict, name: str) -> dict:
                      "udp": bool(state.get("udp", False)) if kind == "socks5" else False}
 
 
-def global_profile(state: dict, name: str) -> dict:
+def outbound_nodes_and_groups(state: dict, name: str, fallback_state: dict | None = None,
+                              *, require_udp: bool = False) -> tuple[list[dict], list[dict]]:
     node_name = name + "·节点"
     node = proxy_node(state, node_name)
-    if not node.get("udp"):
+    if require_udp and not node.get("udp"):
         raise SystemExit("mobile-global requires an outbound with confirmed UDP support")
+    if fallback_state is None:
+        return [node], [{"name": name, "type": "select", "proxies": [node_name]}]
+    primary_host = str(state.get("server", "")).strip().lower()
+    fallback_host = str(fallback_state.get("server", "")).strip().lower()
+    if not primary_host or primary_host != fallback_host:
+        raise SystemExit("fallback outbound must use the exact same server host/IP as the primary outbound")
+    if (state.get("kind", "ss"), state.get("port")) == (fallback_state.get("kind", "ss"), fallback_state.get("port")):
+        raise SystemExit("fallback outbound must differ in protocol or port from the primary outbound")
+    fb_name = name + "·备用"
+    fb_node = proxy_node(fallback_state, fb_name)
+    if require_udp and not fb_node.get("udp"):
+        raise SystemExit("mobile-global fallback outbound also requires confirmed UDP support")
+    auto_name = name + "·自动容灾"
+    groups = [
+        {"name": name, "type": "select", "proxies": [auto_name, node_name, fb_name]},
+        {
+            "name": auto_name, "type": "fallback", "proxies": [node_name, fb_name],
+            "url": "https://www.gstatic.com/generate_204", "interval": 120, "timeout": 3000, "lazy": True,
+        },
+    ]
+    return [node, fb_node], groups
+
+
+def global_profile(state: dict, name: str, fallback_state: dict | None = None) -> dict:
+    proxies, groups = outbound_nodes_and_groups(state, name, fallback_state, require_udp=True)
     return {
         "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "info", "ipv6": False,
-        "tun": {"enable": True, "stack": "mixed", "auto-route": True, "strict-route": True,
+        "unified-delay": True, "tcp-concurrent": True, "keep-alive-interval": 15, "find-process-mode": "off",
+        "tun": {"enable": True, "stack": "mixed", "mtu": 1400, "auto-route": True, "strict-route": True,
                 "auto-detect-interface": True, "dns-hijack": ["any:53", "tcp://any:53"]},
         "dns": {"enable": True, "listen": "127.0.0.1:1053", "ipv6": False,
                 "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16", "use-system-hosts": False,
                 "nameserver": [f"https://1.1.1.1/dns-query#{name}", f"https://9.9.9.9/dns-query#{name}"]},
-        "proxies": [node],
-        "proxy-groups": [{"name": name, "type": "select", "proxies": [node_name]}],
+        "proxies": proxies,
+        "proxy-groups": groups,
         "rules": [f"MATCH,{name}"],
     }
 
@@ -469,7 +507,8 @@ def fresh_dns(profile: dict) -> dict:
 
 
 def mainland_split(profile: dict, outbound: str, classic: bool = False,
-                   rules_from: Path | None = None, cn_cidrs: Path | None = None) -> dict:
+                   rules_from: Path | None = None, cn_cidrs: Path | None = None,
+                   block_quic: bool | None = None) -> dict:
     """Apply mainland routing to a dedicated all-traffic Mihomo phone profile."""
     if profile.get("rules") != [f"MATCH,{outbound}"] or not profile.get("tun", {}).get("enable"):
         raise SystemExit("expected a full-tunnel phone profile with a single MATCH to the selected outbound")
@@ -486,6 +525,10 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False,
     if classic:
         if cn_cidrs:
             raise SystemExit("--cn-cidrs is only supported by the Mihomo mobile-cn-split profile")
+        if block_quic:
+            raise SystemExit("--block-quic requires Mihomo --mode mobile-cn-split without --classic-android")
+        for key in MIHOMO_TOP_KEYS:
+            profile.pop(key, None)
         classic_relay_chains(profile)
         bootstrap_hosts = classic_outbound_server_hosts(profile, outbound)
         profile["rules"].extend(["GEOIP,CN,DIRECT", f"MATCH,{outbound}"])
@@ -513,6 +556,8 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False,
         for index, hostname in enumerate(bootstrap_hosts):
             dns["nameserver-policy"][hostname] = CLASSIC_DOMESTIC_DOH[index % len(CLASSIC_DOMESTIC_DOH)]
         return profile
+    has_hy2 = any(isinstance(n, dict) and n.get("type") == "hysteria2" for n in profile.get("proxies", []))
+    should_block_quic = has_hy2 if block_quic is None else bool(block_quic)
     base_url = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo"
     if cn_cidrs:
         cn_provider = {"type": "inline", "behavior": "ipcidr", "payload": read_cn_cidrs(cn_cidrs)}
@@ -523,8 +568,12 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False,
             "path": "./ruleset/personal-vpn/cn-ip.mrs",
         }
     profile["rule-providers"] = {"cn-ip": cn_provider}
+    if should_block_quic:
+        profile["rules"].append(QUIC_REJECT_RULE)
     profile["rules"].extend(["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"])
+    dns["prefer-h3"] = False
     dns["proxy-server-nameserver"] = list(MIHOMO_DOMESTIC_DOH)
+    dns["direct-nameserver"] = list(MIHOMO_DOMESTIC_DOH)
     dns["nameserver-policy"] = {
         f"+.{suffix}": MIHOMO_DOMESTIC_DOH[index % len(MIHOMO_DOMESTIC_DOH)]
         for index, suffix in enumerate(DOMESTIC_DNS_SUFFIXES)
@@ -555,7 +604,9 @@ def apply_domain_priority(profile: dict, outbound: str, domains: tuple[str, ...]
                 and parts[1].strip().lower().rstrip(".") in selected)
 
     priority = [f"DOMAIN-SUFFIX,{domain},{outbound}" for domain in selected]
-    profile["rules"] = priority + [rule for rule in profile["rules"] if not is_selected_suffix(rule)]
+    quic_guard = [rule for rule in profile["rules"] if rule == QUIC_REJECT_RULE]
+    remainder = [rule for rule in profile["rules"] if rule != QUIC_REJECT_RULE and not is_selected_suffix(rule)]
+    profile["rules"] = quic_guard + priority + remainder
     dns = profile.get("dns")
     policy = dns.get("nameserver-policy") if isinstance(dns, dict) else None
     nameservers = dns.get("nameserver") if isinstance(dns, dict) else None
@@ -593,7 +644,7 @@ def apply_x_priority(profile: dict, outbound: str, prioritize_dns: bool = False)
 
 
 def desktop_profile(state: dict, name: str, domains: list[str], base: Path | None,
-                    base_default: str | None) -> dict:
+                    base_default: str | None, fallback_state: dict | None = None) -> dict:
     if base and yaml is None:
         raise SystemExit("PyYAML is required when an existing desktop profile is supplied")
     data = (yaml.safe_load(base.read_bytes()) or {}) if base else {
@@ -607,11 +658,12 @@ def desktop_profile(state: dict, name: str, domains: list[str], base: Path | Non
     proxies = data.setdefault("proxies", [])
     groups = data.setdefault("proxy-groups", [])
     rules = data.setdefault("rules", [])
-    node_name = name + "·节点"
-    if any(x.get("name") in (name, node_name) for x in proxies + groups):
+    new_nodes, new_groups = outbound_nodes_and_groups(state, name, fallback_state, require_udp=False)
+    reserved_names = {item["name"] for item in new_nodes + new_groups}
+    if any(x.get("name") in reserved_names for x in proxies + groups):
         raise SystemExit("base profile already uses generated names")
-    proxies.append(proxy_node(state, node_name))
-    groups.append({"name": name, "type": "select", "proxies": [node_name]})
+    proxies.extend(new_nodes)
+    groups.extend(new_groups)
     new_rules = [f"DOMAIN-SUFFIX,{domain},{name}" for domain in domains]
     if prior_mode in ("direct", "global"):
         default = "DIRECT" if prior_mode == "direct" else base_default
@@ -630,11 +682,14 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--state", type=Path,
                    help="mode-600 deployment state or private proxy spec JSON")
+    p.add_argument("--fallback-state", type=Path,
+                   help="optional mode-600 companion state on the same server (for example ss 28447 behind hysteria2 28448)")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
     p.add_argument("--base", type=Path, help="existing YAML used only by the selected mode")
     p.add_argument("--only-node", help="exact direct Shadowsocks or Hysteria2 node to extract from --base")
+    p.add_argument("--fallback-node", help="optional companion direct node on the same server to extract from --base with --only-node")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
@@ -644,6 +699,11 @@ def main() -> None:
                    help="trusted local CIDR text file for an offline Mihomo cn-ip provider")
     p.add_argument("--hy2-ports", help="optional Mihomo Hysteria2 port-hopping spec (for example 28448,28500-28530)")
     p.add_argument("--hop-interval", help="optional Mihomo Hysteria2 port-hopping interval in seconds (5..300 or MIN-MAX)")
+    quic_group = p.add_mutually_exclusive_group()
+    quic_group.add_argument("--block-quic", dest="block_quic", action="store_true", default=None,
+                            help="reject foreign UDP/443 (HTTP/3 QUIC) ahead of proxy rules on Mihomo mobile-cn-split")
+    quic_group.add_argument("--no-block-quic", dest="block_quic", action="store_false",
+                            help="disable automatic UDP/443 rejection on Hysteria2 Mihomo mobile-cn-split")
     args = p.parse_args()
     if os.name == "nt":
         p.error("Generate private profiles in WSL. Keep the order, keys and YML inside the Linux filesystem.")
@@ -651,15 +711,21 @@ def main() -> None:
         p.error("--classic-rules-from requires --classic-android with --mode mobile-cn-split")
     if args.cn_cidrs and (args.mode != "mobile-cn-split" or args.classic_android):
         p.error("--cn-cidrs requires Mihomo --mode mobile-cn-split without --classic-android")
+    if args.block_quic is not None and (args.mode != "mobile-cn-split" or args.classic_android):
+        p.error("--block-quic / --no-block-quic requires Mihomo --mode mobile-cn-split without --classic-android")
     if args.classic_android and (args.hy2_ports is not None or args.hop_interval is not None):
         p.error("--hy2-ports and --hop-interval require Mihomo without --classic-android")
     if (args.hy2_ports is not None or args.hop_interval is not None) and args.only_node is None and not args.state:
         p.error("--hy2-ports and --hop-interval require --state or --only-node")
+    if args.fallback_node is not None and (not args.fallback_node.strip() or args.only_node is None):
+        p.error("--fallback-node requires --only-node and --base")
+    if args.fallback_state is not None and (not args.state or args.only_node is not None or args.mode == "existing-rules"):
+        p.error("--fallback-state requires --state without --only-node or existing-rules")
     if args.only_node is not None and (not args.only_node.strip() or args.mode not in ("mobile-cn-split", "mobile-global")
                            or not args.base or args.state or args.base_default):
         p.error("--only-node needs --base with mobile-cn-split or mobile-global, without --state")
     if any(path and args.output.resolve() == path.resolve()
-           for path in (args.state, args.base, args.classic_rules_from, args.cn_cidrs)):
+           for path in (args.state, args.fallback_state, args.base, args.classic_rules_from, args.cn_cidrs)):
         p.error("output must differ from the private state and existing base profile")
 
     def apply_cli_hy2_overrides(st: dict) -> dict:
@@ -674,13 +740,18 @@ def main() -> None:
         return st
 
     if args.only_node is not None:
+        base_prof = read_reference_profile(args.base)
         state = apply_cli_hy2_overrides(direct_node_state_from_profile(
-            read_reference_profile(args.base), args.only_node, allow_hysteria2=not args.classic_android
+            base_prof, args.only_node, allow_hysteria2=not args.classic_android
         ))
-        profile = global_profile(state, args.name)
+        fb_state = (
+            direct_node_state_from_profile(base_prof, args.fallback_node, allow_hysteria2=not args.classic_android)
+            if args.fallback_node is not None else None
+        )
+        profile = global_profile(state, args.name, fb_state)
         if args.mode == "mobile-cn-split":
             profile = mainland_split(profile, args.name, args.classic_android,
-                                     args.classic_rules_from, args.cn_cidrs)
+                                     args.classic_rules_from, args.cn_cidrs, args.block_quic)
     elif args.mode == "existing-rules":
         if not (args.use_x or args.domain) or not args.base or args.state or args.base_default:
             p.error("existing-rules needs --use-x or --domain, --base, and an existing --name")
@@ -698,24 +769,25 @@ def main() -> None:
         if args.name not in {item["name"] for item in profile.get("proxy-groups", [])}:
             p.error("--name must identify the original phone proxy group")
         profile = mainland_split(profile, args.name, args.classic_android,
-                                 args.classic_rules_from, args.cn_cidrs)
+                                 args.classic_rules_from, args.cn_cidrs, args.block_quic)
     else:
         if not args.state:
             p.error("--state is required for a new profile")
         state = apply_cli_hy2_overrides(private_state(args.state))
-        if args.classic_android and state.get("kind") == "hysteria2":
+        fb_state = private_state(args.fallback_state) if args.fallback_state else None
+        if args.classic_android and (state.get("kind") == "hysteria2" or (fb_state and fb_state.get("kind") == "hysteria2")):
             p.error("Hysteria2 requires Mihomo (Clash Meta); omit --classic-android or use a Shadowsocks state")
         if args.mode == "desktop-domains":
             if not (args.domain or args.use_x):
                 p.error("desktop-domains requires --use-x or at least one --domain")
-            profile = desktop_profile(state, args.name, args.domain, args.base, args.base_default)
+            profile = desktop_profile(state, args.name, args.domain, args.base, args.base_default, fb_state)
         else:
             if args.base:
                 p.error("--base is supported for desktop-domains and mobile-cn-split")
-            profile = global_profile(state, args.name)
+            profile = global_profile(state, args.name, fb_state)
             if args.mode == "mobile-cn-split":
                 profile = mainland_split(profile, args.name, args.classic_android,
-                                         args.classic_rules_from, args.cn_cidrs)
+                                         args.classic_rules_from, args.cn_cidrs, args.block_quic)
     if args.domain and args.mode != "desktop-domains":
         apply_domain_priority(profile, args.name, tuple(args.domain), args.mode == "mobile-cn-split")
     if args.use_x:

@@ -41,8 +41,8 @@ TEST_HY2_STATE = {
     "password": "synthetic-hy2-smoke-test-only",
     "sni": "www.bing.com",
     "fingerprint": "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
-    "up": "30 mbps",
-    "down": "150 mbps",
+    "up": "15 mbps",
+    "down": "100 mbps",
 }
 
 
@@ -491,22 +491,51 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     assert plan_data["protocol"] == "hysteria2"
     assert plan_data["port"] == 28448
     assert plan_data["sni"] == "www.bing.com"
-    assert plan_data["up_mbps"] == 30 and plan_data["down_mbps"] == 150
+    assert plan_data["up_mbps"] == 15 and plan_data["down_mbps"] == 100
 
     module = load_client_module("elidli_hy2_test")
     outbound = "Personal Hy2 exit"
     hy2_global = module.global_profile(TEST_HY2_STATE, outbound)
+    assert hy2_global["tun"]["mtu"] == 1400
+    assert hy2_global["find-process-mode"] == "off"
+    assert hy2_global["keep-alive-interval"] == 15
+    assert hy2_global["unified-delay"] is True and hy2_global["tcp-concurrent"] is True
     node = hy2_global["proxies"][0]
     assert node["type"] == "hysteria2"
     assert node["port"] == 28448
     assert node["fingerprint"] == TEST_HY2_STATE["fingerprint"]
     assert node["skip-cert-verify"] is True
-    assert node["up"] == "30 mbps" and node["down"] == "150 mbps" and node["udp"] is True
+    assert node["up"] == "15 mbps" and node["down"] == "100 mbps" and node["udp"] is True
 
     hy2_mihomo = module.mainland_split(hy2_global, outbound)
     module.apply_x_priority(hy2_mihomo, outbound, prioritize_dns=True)
-    assert hy2_mihomo["rules"][:4] == [f"DOMAIN-SUFFIX,{d},{outbound}" for d in X_DOMAINS]
+    assert hy2_mihomo["rules"][0] == "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
+    assert hy2_mihomo["rules"][1:5] == [f"DOMAIN-SUFFIX,{d},{outbound}" for d in X_DOMAINS]
     assert hy2_mihomo["rules"][-2:] == ["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"]
+    assert hy2_mihomo["dns"]["prefer-h3"] is False
+    assert all(v.endswith("#DIRECT") for v in hy2_mihomo["dns"]["direct-nameserver"])
+
+    # Same-host dual-protocol automatic failover (Hy2 28448 + SS 28447)
+    dual_global = module.global_profile(TEST_HY2_STATE, outbound, TEST_STATE)
+    assert [p["name"] for p in dual_global["proxies"]] == [f"{outbound}·节点", f"{outbound}·备用"]
+    assert dual_global["proxy-groups"] == [
+        {"name": outbound, "type": "select", "proxies": [f"{outbound}·自动容灾", f"{outbound}·节点", f"{outbound}·备用"]},
+        {
+            "name": f"{outbound}·自动容灾", "type": "fallback",
+            "proxies": [f"{outbound}·节点", f"{outbound}·备用"],
+            "url": "https://www.gstatic.com/generate_204", "interval": 120, "timeout": 3000, "lazy": True,
+        },
+    ]
+    for bad_fb in (
+        TEST_STATE | {"server": "192.0.2.99"},
+        TEST_HY2_STATE,
+    ):
+        try:
+            module.global_profile(TEST_HY2_STATE, outbound, bad_fb)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"unsafe fallback state accepted: {bad_fb}")
 
     mixed_source = {
         "proxies": [
@@ -534,9 +563,45 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
             run("client_config.py", "--state", hy2_state, "--output", hy2_out, "--mode", "mobile-cn-split", "--use-x"),
             "Mihomo Hysteria2 CLI generation",
         )
+        raw_hy2_text = hy2_out.read_text(encoding="utf-8")
+        assert "!!bool" not in raw_hy2_text, "YAML output must not emit !!bool tags"
         written = load_yaml_or_json(hy2_out)
         assert written["proxies"][0]["type"] == "hysteria2"
         assert written["proxies"][0]["fingerprint"] == TEST_HY2_STATE["fingerprint"]
+        assert written["find-process-mode"] == "off", "find-process-mode must parse back as string 'off'"
+        assert written["tun"]["mtu"] == 1400
+        assert written["rules"][0] == "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
+
+        ss_state_file = directory / "ss-companion.json"
+        ss_state_file.write_text(json.dumps(TEST_STATE), encoding="utf-8")
+        os.chmod(ss_state_file, 0o600)
+        dual_out = directory / "phone-dual.yaml"
+        expect_success(
+            run("client_config.py", "--state", hy2_state, "--fallback-state", ss_state_file,
+                "--output", dual_out, "--mode", "mobile-cn-split", "--use-x"),
+            "Mihomo dual-protocol failover CLI generation",
+        )
+        dual_written = load_yaml_or_json(dual_out)
+        assert len(dual_written["proxies"]) == 2
+        assert dual_written["proxy-groups"][0]["proxies"][0] == "个人VPN·固定出口·自动容灾"
+        assert dual_written["proxy-groups"][1]["type"] == "fallback"
+
+        diff_host_state = directory / "foreign-host-ss.json"
+        diff_host_state.write_text(json.dumps(TEST_STATE | {"server": "192.0.2.77"}), encoding="utf-8")
+        os.chmod(diff_host_state, 0o600)
+        assert run(
+            "client_config.py", "--state", hy2_state, "--fallback-state", diff_host_state,
+            "--output", directory / "bad-dual.yaml", "--mode", "mobile-cn-split",
+        ).returncode != 0, "cross-host --fallback-state must be rejected"
+
+        no_q_out = directory / "phone-hy2-no-qblock.yaml"
+        expect_success(
+            run("client_config.py", "--state", hy2_state, "--output", no_q_out,
+                "--mode", "mobile-cn-split", "--no-block-quic", "--use-x"),
+            "Mihomo Hysteria2 --no-block-quic CLI generation",
+        )
+        no_q_written = load_yaml_or_json(no_q_out)
+        assert "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT" not in no_q_written["rules"]
         rejected = run(
             "client_config.py", "--state", hy2_state, "--output", directory / "bad-classic.yaml",
             "--mode", "mobile-cn-split", "--classic-android",
@@ -631,7 +696,7 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
         "prepare_state must not write partial state to disk before SSH deploy completes"
     )
     assert st_mem["ports"] == "28500-28530" and st_mem["hop_interval"] == 25
-    assert st_mem["up"] == "30 mbps" and st_mem["down"] == "150 mbps"
+    assert st_mem["up"] == "15 mbps" and st_mem["down"] == "100 mbps"
     assert st_mem["outbound_mode"] == "auto-detect"
 
     # Verify client_config.py port-hopping, 0.0.0.0/8 bogon guard, and non-.cn domestic DNS/Fake-IP leak filters
@@ -639,9 +704,9 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     hop_node = hop_prof["proxies"][0]
     assert hop_node["ports"] == "28448,28500-28530" and hop_node["hop-interval"] == "15-30"
     assert "IP-CIDR,0.0.0.0/8,DIRECT,no-resolve" in hop_prof["rules"]
-    for dom in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xiaomixiaoai.com"):
+    for dom in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xiaomixiaoai.com", "+.dpfile.com", "+.bytegoofy.com", "+.larkoffice.com", "+.12306.cn"):
         assert dom in hop_prof["dns"]["nameserver-policy"], f"missing domestic DNS policy for {dom}"
-    for filt in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net"):
+    for filt in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "captive.apple.com", "stun.*.*"):
         assert filt in hop_prof["dns"]["fake-ip-filter"], f"missing fake-ip-filter for {filt}"
 
     extracted_hop = module.direct_node_state_from_profile(
