@@ -765,8 +765,7 @@ def apply_hy2_runtime_options(state: dict[str, object], args: argparse.Namespace
         state.pop("down", None)
     if args.hop_ports:
         start_p, end_p = args.hop_ports
-        ports_spec = f"{start_p}-{end_p}" if start_p <= args.listen_port <= end_p else f"{args.listen_port},{start_p}-{end_p}"
-        state["ports"] = ports_spec
+        state["ports"] = f"{start_p}-{end_p}"
         state["hop_interval"] = args.hop_interval
         state["hop_range"] = [start_p, end_p]
     else:
@@ -961,10 +960,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--method", choices=METHODS, default="aes-128-gcm")
     p.add_argument("--sni", type=sni_hostname, default="www.bing.com", help="TLS SNI/masquerade domain for hysteria2")
     p.add_argument("--outbound-mode", choices=OUTBOUND_MODES, default="auto-detect", help="direct outbound IP mode for hysteria2 (auto-detect sets 4 on IPv4-only hosts)")
-    p.add_argument("--hop-ports", type=hop_port_range, default=None, help="optional UDP port-hopping range START-END (for example 28500-28530) for hysteria2")
+    p.add_argument("--hop-ports", type=hop_port_range, default=None, help="optional UDP port-hopping range START-END for hysteria2 (leave unset by default behind Cone NAT unless verified)")
     p.add_argument("--hop-interval", type=hop_interval_seconds, default=25, help="client UDP port-hopping interval in seconds when --hop-ports is set")
-    p.add_argument("--up-mbps", type=bandwidth_mbps, default=15, help="client upload hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
-    p.add_argument("--down-mbps", type=bandwidth_mbps, default=50, help="client download hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
+    p.add_argument("--up-mbps", type=bandwidth_mbps, default=30, help="client upload hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
+    p.add_argument("--down-mbps", type=bandwidth_mbps, default=150, help="client download hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
     p.add_argument("--port", type=ssh_port, help="SSH port")
     p.add_argument("--identity", type=Path, help="SSH private key path")
     p.add_argument("--control-path", type=Path, help="existing OpenSSH control socket")

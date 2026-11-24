@@ -491,7 +491,7 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     assert plan_data["protocol"] == "hysteria2"
     assert plan_data["port"] == 28448
     assert plan_data["sni"] == "www.bing.com"
-    assert plan_data["up_mbps"] == 15 and plan_data["down_mbps"] == 50
+    assert plan_data["up_mbps"] == 30 and plan_data["down_mbps"] == 150
 
     module = load_client_module("elidli_hy2_test")
     outbound = "Personal Hy2 exit"
@@ -630,7 +630,8 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     assert existed is False and not (directory / "st" / "atomic-check.json").exists(), (
         "prepare_state must not write partial state to disk before SSH deploy completes"
     )
-    assert st_mem["ports"] == "28448,28500-28530" and st_mem["hop_interval"] == 25
+    assert st_mem["ports"] == "28500-28530" and st_mem["hop_interval"] == 25
+    assert st_mem["up"] == "30 mbps" and st_mem["down"] == "150 mbps"
     assert st_mem["outbound_mode"] == "auto-detect"
 
     # Verify client_config.py port-hopping, 0.0.0.0/8 bogon guard, and non-.cn domestic DNS/Fake-IP leak filters
