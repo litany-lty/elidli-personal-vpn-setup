@@ -58,9 +58,11 @@ elif expected["state"] == "present":
     raw = config_path.read_text()
     m_port = re.search(r"(?m)^listen:\s*:(\d+)\s*$", raw)
     m_pass = re.search(r'(?m)^\s*password:\s*"([^"]+)"\s*$', raw)
+    m_sni = re.search(r"(?m)^\s*url:\s*https://([^/\s]+)/?\s*$", raw)
     comparable = {
         "password": m_pass.group(1) if m_pass else "",
         "port": int(m_port.group(1)) if m_port else 0,
+        "sni": m_sni.group(1).lower() if m_sni else "",
     }
     digest = hashlib.sha256(json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if digest != expected["fingerprint"]:
@@ -114,7 +116,7 @@ os.replace(tmp, "/usr/local/bin/hysteria")
 PY
 fi
 
-id -u "$account" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -M "$account"
+getent passwd "$account" >/dev/null 2>&1 || adduser --system --group --no-create-home --home /nonexistent --shell /usr/sbin/nologin "$account" >/dev/null 2>&1 || useradd -r -U -s /usr/sbin/nologin -M "$account"
 install -d -m 0750 -o root -g "$account" /etc/hysteria
 
 sni=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sni"])' "$bundle")
@@ -230,7 +232,7 @@ listeners=""
 i=0
 while [ "$i" -lt 30 ]; do
   main_pid=$(systemctl show "$service" -p MainPID --value)
-  listener_lines=$(ss -H -lunp "sport = :${listen_port}")
+  listener_lines=$(ss -H -lntup "sport = :${listen_port}")
   listeners=$(printf '%s\n' "$listener_lines" | awk -v pid="pid=${main_pid}," 'index($0,pid) {print $1}' | sort -u | paste -sd, -)
   case ",$listeners," in *,udp,*) break;; esac
   i=$((i + 1)); sleep 0.1
@@ -505,9 +507,10 @@ def remote_service_fingerprint(args: argparse.Namespace) -> tuple[str, str | Non
             "raw=c.read_text() if c.exists() else ''; "
             "mp=re.search(r'(?m)^listen:\\s*:(\\d+)\\s*$', raw); "
             "mw=re.search(r'(?m)^\\s*password:\\s*\"([^\"]+)\"\\s*$', raw); "
+            "ms=re.search(r'(?m)^\\s*url:\\s*https://([^/\\s]+)/?\\s*$', raw); "
             "print('missing' if not c.exists() and not u.exists() else "
             "('partial' if not c.exists() or not u.exists() else "
-            "'present '+hashlib.sha256(json.dumps({'password':mw.group(1) if mw else '','port':int(mp.group(1)) if mp else 0},"
+            "'present '+hashlib.sha256(json.dumps({'password':mw.group(1) if mw else '','port':int(mp.group(1)) if mp else 0,'sni':ms.group(1).lower() if ms else ''},"
             "sort_keys=True,separators=(',',':')).encode()).hexdigest()))"
         )
     else:
@@ -591,7 +594,8 @@ def write_state_atomic(path: Path, state_dir: Path, service_id_val: str, state: 
             os.unlink(temporary.name)
 
 
-def load_or_create_state(args: argparse.Namespace) -> dict[str, object]:
+def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+    """Load an existing validated state or synthesize a new in-memory state without writing prematurely."""
     path = state_file(args)
     args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(args.state_dir, 0o700)
@@ -611,7 +615,16 @@ def load_or_create_state(args: argparse.Namespace) -> dict[str, object]:
         for key, expected in checks:
             if state.get(key) != expected:
                 raise SystemExit(f"existing state differs at {key}; choose a new service id or use explicit rotation workflow")
-        return state
+        if args.protocol == "hysteria2":
+            if args.up_mbps > 0:
+                state["up"] = f"{args.up_mbps} mbps"
+            else:
+                state.pop("up", None)
+            if args.down_mbps > 0:
+                state["down"] = f"{args.down_mbps} mbps"
+            else:
+                state.pop("down", None)
+        return state, True
     if args.protocol == "hysteria2":
         state: dict[str, object] = {
             "version": 1, "kind": "hysteria2", "service_id": args.service_id,
@@ -628,7 +641,13 @@ def load_or_create_state(args: argparse.Namespace) -> dict[str, object]:
             "port": args.listen_port, "method": args.method,
             "password": secrets.token_urlsafe(32),
         }
-    write_state_atomic(path, args.state_dir, args.service_id, state)
+    return state, False
+
+
+def load_or_create_state(args: argparse.Namespace) -> dict[str, object]:
+    state, existed = prepare_state(args)
+    if not existed:
+        write_state_atomic(state_file(args), args.state_dir, args.service_id, state)
     return state
 
 
@@ -687,10 +706,10 @@ def deploy(args: argparse.Namespace) -> None:
             raise SystemExit("remote service is incomplete; inspect it before deployment")
         if remote_state == "present" and not local_path.exists():
             raise SystemExit("remote service already exists but matching local state is missing; use an explicit rotation/recovery workflow")
-        state = load_or_create_state(args)
+        state, _ = prepare_state(args)
         if remote_state == "present":
             if args.protocol == "hysteria2":
-                comparable: dict[str, object] = {"password": state["password"], "port": state["port"]}
+                comparable: dict[str, object] = {"password": state["password"], "port": state["port"], "sni": str(state["sni"]).lower()}
             else:
                 comparable = {"password": state["password"], "server_port": state["port"], "method": state["method"]}
             local_hash = hashlib.sha256(json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -716,7 +735,7 @@ def deploy(args: argparse.Namespace) -> None:
         if args.protocol == "hysteria2":
             meta = json.loads(remote_out.splitlines()[-1])
             state["fingerprint"] = meta["fingerprint"]
-            write_state_atomic(local_path, args.state_dir, args.service_id, state)
+        write_state_atomic(local_path, args.state_dir, args.service_id, state)
         print(json.dumps({"status": "deployed", "protocol": args.protocol, "state_file": str(local_path), "remote": remote_out}, ensure_ascii=False))
 
 

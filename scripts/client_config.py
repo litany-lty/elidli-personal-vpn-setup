@@ -61,17 +61,23 @@ def proxy_node(state: dict, name: str) -> dict:
     if kind == "ss":
         return common | {"type": "ss", "cipher": state["method"], "password": state["password"], "udp": True}
     if kind == "hysteria2":
-        for key in ("password", "sni", "fingerprint"):
+        for key in ("password", "sni"):
             if not isinstance(state.get(key), str) or not state[key].strip():
                 raise SystemExit(f"private hysteria2 spec is missing {key}")
+        skip_verify = bool(state.get("skip_cert_verify", True))
+        fp = state.get("fingerprint")
+        has_fp = isinstance(fp, str) and bool(fp.strip())
+        if skip_verify and not has_fp:
+            raise SystemExit("private hysteria2 spec with skip_cert_verify=true requires a pinned fingerprint")
         node = common | {
             "type": "hysteria2",
             "password": state["password"],
             "sni": state["sni"].strip(),
-            "skip-cert-verify": bool(state.get("skip_cert_verify", True)),
-            "fingerprint": state["fingerprint"].strip(),
+            "skip-cert-verify": skip_verify,
             "udp": True,
         }
+        if has_fp:
+            node["fingerprint"] = fp.strip()
         for bw_key in ("up", "down"):
             if isinstance(state.get(bw_key), str) and state[bw_key].strip():
                 node[bw_key] = state[bw_key].strip()
@@ -124,19 +130,24 @@ def direct_node_state_from_profile(profile: dict, node_name: str, *, allow_hyste
         if unsupported:
             raise SystemExit("the selected node has unsupported dependencies or transport fields: "
                              + ", ".join(sorted(unsupported)))
+        skip_verify = bool(node.get("skip-cert-verify", False))
+        fp = node.get("fingerprint")
+        has_fp = isinstance(fp, str) and bool(fp.strip())
         if (not isinstance(node.get("server"), str) or not node["server"].strip()
                 or type(node.get("port")) is not int or not 1 <= node["port"] <= 65535
                 or any(not isinstance(node.get(key), str) or not node[key].strip()
-                       for key in ("password", "sni", "fingerprint"))):
-            raise SystemExit("the selected Hysteria2 node requires server, port, password, sni and pinned fingerprint")
+                       for key in ("password", "sni"))
+                or (skip_verify and not has_fp)):
+            raise SystemExit("the selected Hysteria2 node requires server, port, password, sni, and either CA verification or a pinned fingerprint")
         if node.get("udp") is False:
             raise SystemExit("the selected Hysteria2 node must support UDP")
         extracted = {
             "kind": "hysteria2", "server": node["server"], "port": node["port"],
             "password": node["password"], "sni": node["sni"],
-            "skip_cert_verify": bool(node.get("skip-cert-verify", True)),
-            "fingerprint": node["fingerprint"],
+            "skip_cert_verify": skip_verify,
         }
+        if has_fp:
+            extracted["fingerprint"] = fp.strip()
         for bw_key in ("up", "down"):
             if isinstance(node.get(bw_key), str) and node[bw_key].strip():
                 extracted[bw_key] = node[bw_key].strip()
@@ -319,6 +330,8 @@ def classic_outbound_server_hosts(profile: dict, outbound: str) -> list[str]:
         node = proxies.get(name)
         if not node:
             raise SystemExit(f"classic outbound dependency {name!r} does not exist")
+        if node.get("type") in ("hysteria2", "hysteria", "tuic", "vless", "wireguard", "anytls"):
+            raise SystemExit(f"classic Clash does not support outbound proxy type {node.get('type')!r}; use Mihomo")
         server = node.get("server")
         try:
             ipaddress.ip_address(server)

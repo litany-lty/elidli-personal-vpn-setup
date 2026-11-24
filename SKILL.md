@@ -1,7 +1,7 @@
 ---
 name: elidli-personal-vpn-setup
 metadata:
-  version: "1.5.0"
+  version: "1.5.1"
 license: MIT
 description: Plan and set up a personal VPN with an offline VPS catalog, official price checks and Clash-compatible mobile or desktop routing. 帮个人按地区、固定或独享出口、预算与流量选择 VPN，复核已选套餐，接续已购主机，支持 Shadowsocks 与高丢包 Hysteria2 并存部署及手机电脑分流清理。
 ---

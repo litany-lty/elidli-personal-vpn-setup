@@ -543,6 +543,70 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
         )
         assert rejected.returncode != 0, "classic-android accepted hysteria2 state"
 
+        # Guardrail: migrating a Hysteria2 global base profile with --classic-android must also fail closed
+        hy2_glob_file = directory / "hy2-global-base.yaml"
+        expect_success(
+            run("client_config.py", "--state", hy2_state, "--output", hy2_glob_file, "--mode", "mobile-global"),
+            "Mihomo Hysteria2 global generation",
+        )
+        try:
+            import yaml as _yaml_check  # type: ignore[import-not-found]
+        except ImportError:
+            _yaml_check = None
+        if _yaml_check is not None:
+            rejected_base = run(
+                "client_config.py", "--mode", "mobile-cn-split", "--base", hy2_glob_file,
+                "--name", "个人VPN·固定出口", "--classic-android", "--output", directory / "bad-migrated-classic.yaml",
+            )
+            assert rejected_base.returncode != 0, "classic-android --base migration leaked hysteria2 node"
+
+    # Domain-backed CA-verified Hysteria2 (skip-cert-verify=false without fingerprint) must succeed,
+    # whereas skip-cert-verify=true without fingerprint must fail closed.
+    ca_hy2_source = {
+        "proxies": [{
+            "name": "CA Hy2", "type": "hysteria2", "server": "vpn.example.org", "port": 443,
+            "password": "SYNTHETIC-CA-SECRET", "sni": "vpn.example.org", "skip-cert-verify": False, "udp": True,
+        }],
+        "proxy-groups": [{"name": "G", "type": "select", "proxies": ["CA Hy2"]}],
+        "rules": ["MATCH,G"],
+    }
+    ca_extracted = module.direct_node_state_from_profile(ca_hy2_source, "CA Hy2", allow_hysteria2=True)
+    assert ca_extracted["skip_cert_verify"] is False and "fingerprint" not in ca_extracted
+    ca_prof = module.global_profile(ca_extracted, outbound)
+    assert ca_prof["proxies"][0]["skip-cert-verify"] is False and "fingerprint" not in ca_prof["proxies"][0]
+
+    insecure_hy2_source = copy.deepcopy(ca_hy2_source)
+    insecure_hy2_source["proxies"][0]["skip-cert-verify"] = True
+    try:
+        module.direct_node_state_from_profile(insecure_hy2_source, "CA Hy2", allow_hysteria2=True)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("unpinned skip-cert-verify=true Hysteria2 node was accepted")
+
+    # Verify deploy.py REMOTE_HY2_SCRIPT invariants (iproute2 -lntup Netid column, group creation, SNI hash, deferred atomic state)
+    deploy_spec = importlib.util.spec_from_file_location("elidli_deploy_check", SCRIPTS / "deploy.py")
+    assert deploy_spec and deploy_spec.loader
+    deploy_mod = importlib.util.module_from_spec(deploy_spec)
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        deploy_spec.loader.exec_module(deploy_mod)
+    finally:
+        sys.path.pop(0)
+    assert 'ss -H -lntup "sport = :${listen_port}"' in deploy_mod.REMOTE_HY2_SCRIPT, (
+        "REMOTE_HY2_SCRIPT must pass both -t and -u to ss so Linux iproute2 emits the Netid column"
+    )
+    assert "adduser --system --group" in deploy_mod.REMOTE_HY2_SCRIPT
+    ns = deploy_mod.parser().parse_args([
+        "deploy", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+        "--service-id", "atomic-check", "--protocol", "hysteria2", "--state-dir", str(directory / "st"),
+    ])
+    ns.listen_port = 28448
+    st_mem, existed = deploy_mod.prepare_state(ns)
+    assert existed is False and not (directory / "st" / "atomic-check.json").exists(), (
+        "prepare_state must not write partial state to disk before SSH deploy completes"
+    )
+
 
 def main() -> int:
     required = (
