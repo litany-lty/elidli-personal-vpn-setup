@@ -25,22 +25,26 @@ except ImportError:  # Native Windows; use this workflow from WSL instead.
 
 PROTOCOLS = ("ss", "hysteria2")
 METHODS = ("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305")
+OUTBOUND_MODES = ("auto-detect", "auto", "4", "6", "46", "64")
 REMOTE_HY2_SCRIPT = r'''set -eu
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 umask 077
 bundle=$1
 service_id=$2
 service="personal-vpn-${service_id}"
+hop_service="${service}-hop"
+hop_helper="/usr/local/libexec/${service}-hop"
 config="/etc/hysteria/${service}.yaml"
 cert="/etc/hysteria/${service}.crt"
 key="/etc/hysteria/${service}.key"
 unit="/etc/systemd/system/${service}.service"
+hop_unit="/etc/systemd/system/${hop_service}.service"
 account="personal-vpn-hy2"
 
 exec 9>"/run/lock/${service}.lock"
 flock -n 9 || { echo "another deployment is already running for ${service}" >&2; exit 1; }
 
-cleanup() { rm -f "$bundle" "$config.new" "$unit.new"; }
+cleanup() { rm -f "$bundle" "$config.new" "$unit.new" "$hop_unit.new" "$hop_helper.new"; }
 trap cleanup EXIT
 
 python3 - "$bundle" "$config" "$unit" <<'PY'
@@ -74,10 +78,43 @@ PY
 os_id=$(. /etc/os-release; printf '%s' "$ID")
 case "$os_id" in debian|ubuntu) ;; *) echo "supported remote OS is Debian or Ubuntu" >&2; exit 1;; esac
 
-if ! command -v openssl >/dev/null 2>&1 || [ ! -f /etc/ssl/certs/ca-certificates.crt ]; then
+hop_range=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])).get("hop_range"); print(f"{r[0]}-{r[1]}" if r else "")' "$bundle")
+if [ -n "$hop_range" ]; then
+  python3 - "$bundle" "$service" <<'PY'
+import json, subprocess, sys
+d = json.loads(open(sys.argv[1]).read())
+service = sys.argv[2]
+start_p, end_p = d["hop_range"]
+listen_p = int(d["port"])
+main_pid = subprocess.run(["systemctl", "show", service, "-p", "MainPID", "--value"], capture_output=True, text=True).stdout.strip()
+ss_out = subprocess.run(["ss", "-H", "-lun"], capture_output=True, text=True, check=True).stdout
+for line in ss_out.splitlines():
+    cols = line.split()
+    if len(cols) < 4:
+        continue
+    local = cols[3]
+    try:
+        bound_port = int(local.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        continue
+    if start_p <= bound_port <= end_p and bound_port != listen_p:
+        if main_pid and main_pid != "0" and f"pid={main_pid}," in line:
+            continue
+        raise SystemExit(f"UDP port {bound_port} inside --hop-ports {start_p}-{end_p} is already in use")
+PY
+fi
+
+need_pkgs=""
+command -v openssl >/dev/null 2>&1 || need_pkgs="$need_pkgs openssl"
+[ -f /etc/ssl/certs/ca-certificates.crt ] || need_pkgs="$need_pkgs ca-certificates"
+if [ -n "$hop_range" ] && ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+  need_pkgs="$need_pkgs nftables"
+fi
+if [ -n "$need_pkgs" ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 update >/dev/null
-  apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -y --no-install-recommends install openssl ca-certificates >/dev/null
+  # shellcheck disable=SC2086
+  apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -y --no-install-recommends install $need_pkgs >/dev/null
 fi
 
 cat >/etc/sysctl.d/99-personal-vpn-quic.conf <<'EOF'
@@ -128,11 +165,33 @@ fi
 chown root:"$account" "$key" "$cert"
 chmod 0640 "$key" "$cert"
 
-python3 - "$bundle" "$config.new" "$unit.new" "$service" "$cert" "$key" <<'PY'
-import json, pathlib, sys
-bundle, config_path, unit_path, service, cert, key = sys.argv[1:]
+python3 - "$bundle" "$config.new" "$unit.new" "$hop_unit.new" "$hop_helper.new" "$service" "$service_id" "$cert" "$key" <<'PY'
+import json, pathlib, re, sys
+bundle, config_path, unit_path, hop_unit_path, hop_helper_path, service, service_id, cert, key = sys.argv[1:]
 d = json.loads(pathlib.Path(bundle).read_text())
 sni = d["sni"]
+req_mode = d.get("outbound_mode", "auto-detect")
+if req_mode == "auto-detect":
+    has_global_v6_addr = False
+    has_v6_default_route = False
+    try:
+        for line in pathlib.Path("/proc/net/if_inet6").read_text().splitlines():
+            cols = line.split()
+            if len(cols) >= 6 and cols[3] == "00" and cols[5] != "lo" and (int(cols[0][:4], 16) & 0xE000) == 0x2000:
+                has_global_v6_addr = True
+                break
+        for line in pathlib.Path("/proc/net/ipv6_route").read_text().splitlines():
+            cols = line.split()
+            if (len(cols) >= 10 and cols[0] == "0" * 32 and cols[1] == "00"
+                    and cols[9] != "lo" and (int(cols[8], 16) & 0x201) == 0x1):
+                has_v6_default_route = True
+                break
+    except OSError:
+        pass
+    effective_mode = "auto" if (has_global_v6_addr and has_v6_default_route) else "4"
+else:
+    effective_mode = req_mode
+
 cfg = f"""listen: :{d["port"]}
 
 tls:
@@ -149,6 +208,12 @@ quic:
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
 
+outbounds:
+  - name: direct
+    type: direct
+    direct:
+      mode: {effective_mode}
+
 ignoreClientBandwidth: false
 
 masquerade:
@@ -158,10 +223,12 @@ masquerade:
     rewriteHost: true
 """
 pathlib.Path(config_path).write_text(cfg)
+hop_range = d.get("hop_range")
+wants_hop = f"\nWants={service}-hop.service" if hop_range else ""
 unit = f"""[Unit]
 Description=Private Hysteria2 service ({service})
 After=network-online.target
-Wants=network-online.target
+Wants=network-online.target{wants_hop}
 
 [Service]
 Type=simple
@@ -187,27 +254,104 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 """
 pathlib.Path(unit_path).write_text(unit)
+if hop_range:
+    start_p, end_p = int(hop_range[0]), int(hop_range[1])
+    listen_p = int(d["port"])
+    safe_id = re.sub(r"[^a-z0-9_]", "_", service_id)
+    tbl = f"pvpn_{safe_id}"
+    helper = f"""#!/bin/sh
+set -eu
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+TBL="{tbl}"
+TAG="{service}-hop"
+HOP_START="{start_p}"
+HOP_END="{end_p}"
+LISTEN_PORT="{listen_p}"
+case "${{1:-}}" in
+  start)
+    if command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1; then
+      nft add table ip "$TBL"
+      nft flush table ip "$TBL"
+      nft "add chain ip $TBL prerouting {{ type nat hook prerouting priority dstnat; policy accept; }}"
+      nft "add rule ip $TBL prerouting udp dport ${{HOP_START}}-${{HOP_END}} counter redirect to :${{LISTEN_PORT}}"
+    else
+      while iptables -t nat -D PREROUTING -p udp --dport "${{HOP_START}}:${{HOP_END}}" -m comment --comment "$TAG" -j REDIRECT --to-ports "$LISTEN_PORT" 2>/dev/null; do :; done
+      iptables -t nat -A PREROUTING -p udp --dport "${{HOP_START}}:${{HOP_END}}" -m comment --comment "$TAG" -j REDIRECT --to-ports "$LISTEN_PORT"
+    fi
+    ;;
+  stop)
+    if command -v nft >/dev/null 2>&1 && nft list table ip "$TBL" >/dev/null 2>&1; then
+      nft delete table ip "$TBL" 2>/dev/null || true
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+      while iptables -t nat -D PREROUTING -p udp --dport "${{HOP_START}}:${{HOP_END}}" -m comment --comment "$TAG" -j REDIRECT --to-ports "$LISTEN_PORT" 2>/dev/null; do :; done
+    fi
+    ;;
+  *)
+    echo "usage: $0 start|stop" >&2
+    exit 2
+    ;;
+esac
+"""
+    pathlib.Path(hop_helper_path).write_text(helper)
+    hop_u = f"""[Unit]
+Description=Isolated UDP port-hopping redirect for {service} ({start_p}-{end_p} -> {listen_p})
+After=network-online.target
+PartOf={service}.service
+Before={service}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/{service}-hop start
+ExecStop=/usr/local/libexec/{service}-hop stop
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+"""
+    pathlib.Path(hop_unit_path).write_text(hop_u)
+pathlib.Path(f"{config_path}.mode").write_text(effective_mode)
 PY
+effective_mode=$(cat "$config.new.mode"); rm -f "$config.new.mode"
 chown root:"$account" "$config.new"
 chmod 0640 "$config.new"
 chmod 0644 "$unit.new"
+if [ -n "$hop_range" ]; then
+  install -d -m 0755 /usr/local/libexec
+  chown root:root "$hop_helper.new"
+  chmod 0750 "$hop_helper.new"
+  chmod 0644 "$hop_unit.new"
+fi
 
 stamp=$(date +%Y%m%d%H%M%S)
-old_active=0; old_enabled=0
+old_active=0; old_enabled=0; old_hop_active=0; old_hop_enabled=0
 systemctl is-active --quiet "$service" && old_active=1 || true
 systemctl is-enabled --quiet "$service" && old_enabled=1 || true
-had_config=0; had_unit=0
+systemctl is-active --quiet "$hop_service" 2>/dev/null && old_hop_active=1 || true
+systemctl is-enabled --quiet "$hop_service" 2>/dev/null && old_hop_enabled=1 || true
+had_config=0; had_unit=0; had_hop_unit=0; had_hop_helper=0
 [ ! -e "$config" ] || had_config=1
 [ ! -e "$unit" ] || had_unit=1
+[ ! -e "$hop_unit" ] || had_hop_unit=1
+[ ! -e "$hop_helper" ] || had_hop_helper=1
 [ ! -e "$config" ] || cp -p "$config" "${config}.rollback-${stamp}"
 [ ! -e "$unit" ] || cp -p "$unit" "${unit}.rollback-${stamp}"
+[ ! -e "$hop_unit" ] || cp -p "$hop_unit" "${hop_unit}.rollback-${stamp}"
+[ ! -e "$hop_helper" ] || cp -p "$hop_helper" "${hop_helper}.rollback-${stamp}"
 restore() {
+  systemctl stop "$hop_service" >/dev/null 2>&1 || true
   systemctl stop "$service" >/dev/null 2>&1 || true
+  [ "$old_hop_enabled" -eq 1 ] || systemctl disable "$hop_service" >/dev/null 2>&1 || true
   [ "$old_enabled" -eq 1 ] || systemctl disable "$service" >/dev/null 2>&1 || true
   if [ "$had_config" -eq 1 ]; then mv -f "${config}.rollback-${stamp}" "$config"; else rm -f "$config"; fi
   if [ "$had_unit" -eq 1 ]; then mv -f "${unit}.rollback-${stamp}" "$unit"; else rm -f "$unit"; fi
+  if [ "$had_hop_unit" -eq 1 ]; then mv -f "${hop_unit}.rollback-${stamp}" "$hop_unit"; else rm -f "$hop_unit"; fi
+  if [ "$had_hop_helper" -eq 1 ]; then mv -f "${hop_helper}.rollback-${stamp}" "$hop_helper"; else rm -f "$hop_helper"; fi
   systemctl daemon-reload
+  [ "$old_hop_enabled" -eq 0 ] || systemctl enable "$hop_service" >/dev/null 2>&1 || true
   [ "$old_enabled" -eq 0 ] || systemctl enable "$service" >/dev/null 2>&1 || true
+  [ "$old_hop_active" -eq 0 ] || systemctl start "$hop_service" >/dev/null 2>&1 || true
   [ "$old_active" -eq 0 ] || systemctl start "$service" >/dev/null 2>&1 || true
 }
 finish_replacement() {
@@ -220,9 +364,24 @@ finish_replacement() {
 }
 trap finish_replacement EXIT
 trap 'exit 1' HUP INT TERM
+if [ "$had_hop_unit" -eq 1 ] && [ -z "$hop_range" ]; then
+  systemctl stop "$hop_service" >/dev/null 2>&1 || true
+  systemctl disable "$hop_service" >/dev/null 2>&1 || true
+  rm -f "$hop_unit" "$hop_helper"
+fi
 mv "$config.new" "$config"
 mv "$unit.new" "$unit"
+if [ -n "$hop_range" ]; then
+  mv "$hop_helper.new" "$hop_helper"
+  mv "$hop_unit.new" "$hop_unit"
+fi
 systemctl daemon-reload
+if [ -n "$hop_range" ]; then
+  if ! systemctl enable "$hop_service" >/dev/null || ! systemctl restart "$hop_service"; then
+    echo "UDP port-hopping rule activation failed; restoring previous service" >&2
+    exit 1
+  fi
+fi
 if ! systemctl enable "$service" >/dev/null || ! systemctl restart "$service" || ! systemctl is-active --quiet "$service"; then
   echo "activation failed; restoring previous service" >&2
   exit 1
@@ -246,10 +405,10 @@ case ",$listeners," in
 esac
 trap cleanup EXIT
 trap - HUP INT TERM
-rm -f "${config}.rollback-${stamp}" "${unit}.rollback-${stamp}"
+rm -f "${config}.rollback-${stamp}" "${unit}.rollback-${stamp}" "${hop_unit}.rollback-${stamp}" "${hop_helper}.rollback-${stamp}"
 svc_state=$(systemctl show "$service" -p ActiveState -p SubState -p NRestarts -p User --value | paste -sd, -)
 cert_fp=$(openssl x509 -noout -fingerprint -sha256 -in "$cert" | cut -d= -f2)
-python3 -c 'import json,sys; print(json.dumps({"service": sys.argv[1], "listeners": sys.argv[2], "fingerprint": sys.argv[3]}))' "$svc_state" "$listeners" "$cert_fp"
+python3 -c 'import json,sys; print(json.dumps({"service": sys.argv[1], "listeners": sys.argv[2], "fingerprint": sys.argv[3], "outbound_mode": sys.argv[4], "hop_range": sys.argv[5] or None}))' "$svc_state" "$listeners" "$cert_fp" "$effective_mode" "$hop_range"
 '''
 REMOTE_SCRIPT = r'''set -eu
 umask 077
@@ -594,6 +753,28 @@ def write_state_atomic(path: Path, state_dir: Path, service_id_val: str, state: 
             os.unlink(temporary.name)
 
 
+def apply_hy2_runtime_options(state: dict[str, object], args: argparse.Namespace) -> None:
+    state["outbound_mode"] = args.outbound_mode
+    if args.up_mbps > 0:
+        state["up"] = f"{args.up_mbps} mbps"
+    else:
+        state.pop("up", None)
+    if args.down_mbps > 0:
+        state["down"] = f"{args.down_mbps} mbps"
+    else:
+        state.pop("down", None)
+    if args.hop_ports:
+        start_p, end_p = args.hop_ports
+        ports_spec = f"{start_p}-{end_p}" if start_p <= args.listen_port <= end_p else f"{args.listen_port},{start_p}-{end_p}"
+        state["ports"] = ports_spec
+        state["hop_interval"] = args.hop_interval
+        state["hop_range"] = [start_p, end_p]
+    else:
+        state.pop("ports", None)
+        state.pop("hop_interval", None)
+        state.pop("hop_range", None)
+
+
 def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     """Load an existing validated state or synthesize a new in-memory state without writing prematurely."""
     path = state_file(args)
@@ -616,14 +797,7 @@ def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             if state.get(key) != expected:
                 raise SystemExit(f"existing state differs at {key}; choose a new service id or use explicit rotation workflow")
         if args.protocol == "hysteria2":
-            if args.up_mbps > 0:
-                state["up"] = f"{args.up_mbps} mbps"
-            else:
-                state.pop("up", None)
-            if args.down_mbps > 0:
-                state["down"] = f"{args.down_mbps} mbps"
-            else:
-                state.pop("down", None)
+            apply_hy2_runtime_options(state, args)
         return state, True
     if args.protocol == "hysteria2":
         state: dict[str, object] = {
@@ -631,10 +805,7 @@ def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             "server": args.server, "port": args.listen_port,
             "password": secrets.token_urlsafe(24), "sni": args.sni,
         }
-        if args.up_mbps > 0:
-            state["up"] = f"{args.up_mbps} mbps"
-        if args.down_mbps > 0:
-            state["down"] = f"{args.down_mbps} mbps"
+        apply_hy2_runtime_options(state, args)
     else:
         state = {
             "version": 1, "service_id": args.service_id, "server": args.server,
@@ -671,17 +842,23 @@ def inspect(args: argparse.Namespace) -> None:
 
 def plan(args: argparse.Namespace) -> None:
     if args.protocol == "hysteria2":
+        changes = [
+            "verify and install official Hysteria2 binary via SHA-256 if absent",
+            "tune QUIC UDP kernel buffers in /etc/sysctl.d/99-personal-vpn-quic.conf",
+            "create one system account and self-signed P-256 certificate with pinned SHA-256 fingerprint",
+            f"write one isolated config (outbound mode: {args.outbound_mode}) and systemd unit on UDP port without touching existing Shadowsocks ports",
+            "enable and start that unit",
+        ]
+        if args.hop_ports:
+            changes.insert(4, f"install isolated UDP port-hopping redirect ({args.hop_ports[0]}-{args.hop_ports[1]} -> {args.listen_port})")
         summary: dict[str, object] = {
             "target": args.target, "service": f"personal-vpn-{args.service_id}",
             "protocol": "hysteria2", "server": args.server, "port": args.listen_port,
             "sni": args.sni, "up_mbps": args.up_mbps, "down_mbps": args.down_mbps,
-            "changes": [
-                "verify and install official Hysteria2 binary via SHA-256 if absent",
-                "tune QUIC UDP kernel buffers in /etc/sysctl.d/99-personal-vpn-quic.conf",
-                "create one system account and self-signed P-256 certificate with pinned SHA-256 fingerprint",
-                "write one isolated config and systemd unit on UDP port without touching existing Shadowsocks ports",
-                "enable and start that unit",
-            ],
+            "outbound_mode": args.outbound_mode,
+            "hop_ports": f"{args.hop_ports[0]}-{args.hop_ports[1]}" if args.hop_ports else None,
+            "hop_interval": args.hop_interval if args.hop_ports else None,
+            "changes": changes,
             "unchanged": ["SSH policy", "global firewall", "other services and ports (e.g. 28447)", "OS installation"],
         }
     else:
@@ -746,6 +923,23 @@ def bandwidth_mbps(value: str) -> int:
     return parsed
 
 
+def hop_port_range(value: str) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)-(\d+)", value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError("hop port range must be START-END (for example 28500-28530)")
+    start_p, end_p = int(match.group(1)), int(match.group(2))
+    if not (1024 <= start_p < end_p <= 65535) or (end_p - start_p) > 1000:
+        raise argparse.ArgumentTypeError("hop port range must satisfy 1024 <= START < END <= 65535 and span <= 1000 ports")
+    return start_p, end_p
+
+
+def hop_interval_seconds(value: str) -> int:
+    parsed = int(value)
+    if not 5 <= parsed <= 300:
+        raise argparse.ArgumentTypeError("hop interval in seconds must be between 5 and 300")
+    return parsed
+
+
 def sni_hostname(value: str) -> str:
     try:
         host = normalize_public_host(value)
@@ -766,6 +960,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--listen-port", type=port, default=None, help="defaults to 28447 for ss, 28448 for hysteria2")
     p.add_argument("--method", choices=METHODS, default="aes-128-gcm")
     p.add_argument("--sni", type=sni_hostname, default="www.bing.com", help="TLS SNI/masquerade domain for hysteria2")
+    p.add_argument("--outbound-mode", choices=OUTBOUND_MODES, default="auto-detect", help="direct outbound IP mode for hysteria2 (auto-detect sets 4 on IPv4-only hosts)")
+    p.add_argument("--hop-ports", type=hop_port_range, default=None, help="optional UDP port-hopping range START-END (for example 28500-28530) for hysteria2")
+    p.add_argument("--hop-interval", type=hop_interval_seconds, default=25, help="client UDP port-hopping interval in seconds when --hop-ports is set")
     p.add_argument("--up-mbps", type=bandwidth_mbps, default=15, help="client upload hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
     p.add_argument("--down-mbps", type=bandwidth_mbps, default=50, help="client download hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
     p.add_argument("--port", type=ssh_port, help="SSH port")
@@ -780,6 +977,8 @@ def parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     ns = parser().parse_args()
+    if ns.protocol != "hysteria2" and (ns.hop_ports is not None or ns.outbound_mode != "auto-detect"):
+        raise SystemExit("--hop-ports and --outbound-mode are only supported with --protocol hysteria2")
     if ns.listen_port is None:
         ns.listen_port = 28448 if ns.protocol == "hysteria2" else 28447
     {"plan": plan, "inspect": inspect, "deploy": deploy}[ns.action](ns)

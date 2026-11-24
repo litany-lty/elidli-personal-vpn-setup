@@ -584,7 +584,7 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     else:
         raise AssertionError("unpinned skip-cert-verify=true Hysteria2 node was accepted")
 
-    # Verify deploy.py REMOTE_HY2_SCRIPT invariants (iproute2 -lntup Netid column, group creation, SNI hash, deferred atomic state)
+    # Verify deploy.py REMOTE_HY2_SCRIPT invariants (iproute2 -lntup Netid column, group creation, IPv4 auto-detect, isolated hop redirect, deferred atomic state)
     deploy_spec = importlib.util.spec_from_file_location("elidli_deploy_check", SCRIPTS / "deploy.py")
     assert deploy_spec and deploy_spec.loader
     deploy_mod = importlib.util.module_from_spec(deploy_spec)
@@ -597,15 +597,68 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
         "REMOTE_HY2_SCRIPT must pass both -t and -u to ss so Linux iproute2 emits the Netid column"
     )
     assert "adduser --system --group" in deploy_mod.REMOTE_HY2_SCRIPT
+    assert "/proc/net/if_inet6" in deploy_mod.REMOTE_HY2_SCRIPT and "/proc/net/ipv6_route" in deploy_mod.REMOTE_HY2_SCRIPT
+    assert "outbounds:" in deploy_mod.REMOTE_HY2_SCRIPT and "mode: {effective_mode}" in deploy_mod.REMOTE_HY2_SCRIPT
+    assert "prerouting udp dport" in deploy_mod.REMOTE_HY2_SCRIPT and "REDIRECT --to-ports" in deploy_mod.REMOTE_HY2_SCRIPT
+
+    hop_plan = run(
+        "deploy.py", "plan", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+        "--service-id", "personal-hy2", "--protocol", "hysteria2",
+        "--outbound-mode", "4", "--hop-ports", "28500-28530", "--hop-interval", "20",
+    )
+    expect_success(hop_plan, "hysteria2 hop-ports deploy plan")
+    hop_plan_data = json.loads(hop_plan.stdout)
+    assert hop_plan_data["outbound_mode"] == "4"
+    assert hop_plan_data["hop_ports"] == "28500-28530" and hop_plan_data["hop_interval"] == 20
+    assert run(
+        "deploy.py", "plan", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+        "--service-id", "bad-ss-hop", "--protocol", "ss", "--hop-ports", "28500-28530",
+    ).returncode != 0, "ss accepted hysteria2 --hop-ports"
+    assert run(
+        "deploy.py", "plan", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+        "--service-id", "bad-wide-hop", "--protocol", "hysteria2", "--hop-ports", "20000-40000",
+    ).returncode != 0, "overly wide >1000 port range was accepted"
+
     ns = deploy_mod.parser().parse_args([
         "deploy", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
-        "--service-id", "atomic-check", "--protocol", "hysteria2", "--state-dir", str(directory / "st"),
+        "--service-id", "atomic-check", "--protocol", "hysteria2",
+        "--hop-ports", "28500-28530", "--hop-interval", "25",
+        "--state-dir", str(directory / "st"),
     ])
     ns.listen_port = 28448
     st_mem, existed = deploy_mod.prepare_state(ns)
     assert existed is False and not (directory / "st" / "atomic-check.json").exists(), (
         "prepare_state must not write partial state to disk before SSH deploy completes"
     )
+    assert st_mem["ports"] == "28448,28500-28530" and st_mem["hop_interval"] == 25
+    assert st_mem["outbound_mode"] == "auto-detect"
+
+    # Verify client_config.py port-hopping, 0.0.0.0/8 bogon guard, and non-.cn domestic DNS/Fake-IP leak filters
+    hop_prof = module.mainland_split(module.global_profile(TEST_HY2_STATE | {"ports": "28448,28500-28530", "hop_interval": "15-30"}, outbound), outbound)
+    hop_node = hop_prof["proxies"][0]
+    assert hop_node["ports"] == "28448,28500-28530" and hop_node["hop-interval"] == "15-30"
+    assert "IP-CIDR,0.0.0.0/8,DIRECT,no-resolve" in hop_prof["rules"]
+    for dom in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xiaomixiaoai.com"):
+        assert dom in hop_prof["dns"]["nameserver-policy"], f"missing domestic DNS policy for {dom}"
+    for filt in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net"):
+        assert filt in hop_prof["dns"]["fake-ip-filter"], f"missing fake-ip-filter for {filt}"
+
+    extracted_hop = module.direct_node_state_from_profile(
+        {"proxies": [hop_node | {"name": "Hop Hy2"}], "proxy-groups": [], "rules": []},
+        "Hop Hy2", allow_hysteria2=True,
+    )
+    assert extracted_hop["ports"] == "28448,28500-28530" and extracted_hop["hop_interval"] == "15-30"
+    for bad_spec in (
+        TEST_HY2_STATE | {"ports": "28530-28500"},
+        TEST_HY2_STATE | {"ports": "28448", "hop_interval": 2},
+        TEST_HY2_STATE | {"hop_interval": 25},
+    ):
+        try:
+            module.proxy_node(bad_spec, "Bad")
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"invalid hysteria2 hop spec accepted: {bad_spec}")
 
 
 def main() -> int:

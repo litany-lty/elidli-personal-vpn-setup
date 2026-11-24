@@ -7,6 +7,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -18,14 +19,30 @@ except ImportError:  # pragma: no cover
 
 
 LOCAL_DOMAINS = ("localhost", "local", "lan", "home.arpa")
-LOCAL_V4 = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+LOCAL_V4 = ("0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
             "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32")
 LOCAL_V6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
 DOMESTIC_DNS_SUFFIXES = (
-    "cn", "baidu.com", "bdstatic.com", "qq.com", "weixin.com", "taobao.com", "tmall.com",
-    "alipay.com", "jd.com", "360buyimg.com", "bilibili.com", "bilivideo.com", "hdslb.com",
-    "163.com", "126.com", "meituan.com", "dianping.com", "douyin.com", "toutiao.com",
-    "zhihu.com", "zhimg.com", "weibo.com", "amap.com", "autonavi.com", "ctrip.com",
+    "cn", "baidu.com", "bdstatic.com", "bdimg.com",
+    "qq.com", "weixin.com", "wechat.com", "servicewechat.com", "gtimg.com", "tenpay.com",
+    "tencent-cloud.net", "myqcloud.com", "qcloud.com",
+    "taobao.com", "tmall.com", "alipay.com", "alipayobjects.com",
+    "aliyun.com", "aliyuncs.com", "alicdn.com",
+    "jd.com", "jdcloud.com", "360buyimg.com",
+    "bilibili.com", "bilivideo.com", "hdslb.com", "biliapi.net", "biliapi.com",
+    "163.com", "126.com", "126.net", "163yun.com",
+    "meituan.com", "meituan.net", "dianping.com", "sankuai.com",
+    "douyin.com", "douyinvod.com", "douyinpic.com", "toutiao.com", "byteimg.com", "snssdk.com",
+    "xiaohongshu.com", "xhscdn.com", "kuaishou.com", "gifshow.com",
+    "pinduoduo.com", "yangkeduo.com", "pddpic.com",
+    "xiaomi.com", "mi.com", "miui.com", "mi-img.com", "xiaomixiaoai.com",
+    "sandai.net", "xunlei.com",
+    "zhihu.com", "zhimg.com", "weibo.com", "amap.com", "autonavi.com", "ctrip.com", "qunar.com",
+)
+FAKE_IP_FILTER = (
+    "*.lan", "*.local", "*.arpa", "time.*.com", "ntp.*.com",
+    "localhost.ptlogin2.qq.com", "*.msftncsi.com", "www.msftconnecttest.com",
+    "+.market.xiaomi.com", "+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xunlei.com",
 )
 CLASSIC_DOMESTIC_DOH = ("https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query")
 MIHOMO_DOMESTIC_DOH = tuple(f"{server}#DIRECT" for server in CLASSIC_DOMESTIC_DOH)
@@ -55,6 +72,49 @@ def private_write(path: Path, content: str) -> None:
             os.unlink(temporary.name)
 
 
+def validate_hy2_ports(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit("hysteria2 ports must be a non-empty port or range string")
+    cleaned_parts = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise SystemExit("hysteria2 ports contains an empty segment")
+        if "-" in part:
+            m = re.fullmatch(r"(\d+)-(\d+)", part)
+            if not m:
+                raise SystemExit(f"invalid hysteria2 port range {part!r}")
+            start_p, end_p = int(m.group(1)), int(m.group(2))
+            if not (1 <= start_p <= end_p <= 65535):
+                raise SystemExit(f"hysteria2 port range out of bounds: {part!r}")
+            cleaned_parts.append(f"{start_p}-{end_p}")
+        else:
+            if not part.isdigit() or not (1 <= int(part) <= 65535):
+                raise SystemExit(f"invalid hysteria2 port segment {part!r}")
+            cleaned_parts.append(str(int(part)))
+    return ",".join(cleaned_parts)
+
+
+def validate_hop_interval(value: object) -> int | str:
+    if type(value) is int:
+        if not 5 <= value <= 300:
+            raise SystemExit("hysteria2 hop-interval must be between 5 and 300 seconds")
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"\d+", text):
+            parsed = int(text)
+            if not 5 <= parsed <= 300:
+                raise SystemExit("hysteria2 hop-interval must be between 5 and 300 seconds")
+            return parsed
+        m = re.fullmatch(r"(\d+)-(\d+)", text)
+        if m:
+            low, high = int(m.group(1)), int(m.group(2))
+            if 5 <= low <= high <= 300:
+                return f"{low}-{high}"
+    raise SystemExit("hysteria2 hop-interval must be an integer 5..300 or a range MIN-MAX within 5..300")
+
+
 def proxy_node(state: dict, name: str) -> dict:
     kind = state.get("kind", "ss")
     common = {"name": name, "server": state["server"], "port": state["port"]}
@@ -78,6 +138,13 @@ def proxy_node(state: dict, name: str) -> dict:
         }
         if has_fp:
             node["fingerprint"] = fp.strip()
+        ports_raw = state.get("ports")
+        hop_raw = state.get("hop_interval", state.get("hop-interval"))
+        if ports_raw is not None:
+            node["ports"] = validate_hy2_ports(ports_raw)
+            node["hop-interval"] = validate_hop_interval(25 if hop_raw is None else hop_raw)
+        elif hop_raw is not None:
+            raise SystemExit("private hysteria2 spec sets hop_interval without ports")
         for bw_key in ("up", "down"):
             if isinstance(state.get(bw_key), str) and state[bw_key].strip():
                 node[bw_key] = state[bw_key].strip()
@@ -125,7 +192,7 @@ def direct_node_state_from_profile(profile: dict, node_name: str, *, allow_hyste
     if ntype == "hysteria2":
         if not allow_hysteria2:
             raise SystemExit("Hysteria2 requires Mihomo (Clash Meta); classic Clash only supports direct Shadowsocks here")
-        supported = {"name", "type", "server", "port", "password", "sni", "skip-cert-verify", "fingerprint", "up", "down", "udp"}
+        supported = {"name", "type", "server", "port", "ports", "hop-interval", "password", "sni", "skip-cert-verify", "fingerprint", "up", "down", "udp"}
         unsupported = set(node) - supported
         if unsupported:
             raise SystemExit("the selected node has unsupported dependencies or transport fields: "
@@ -148,6 +215,12 @@ def direct_node_state_from_profile(profile: dict, node_name: str, *, allow_hyste
         }
         if has_fp:
             extracted["fingerprint"] = fp.strip()
+        if node.get("ports") is not None:
+            extracted["ports"] = validate_hy2_ports(node["ports"])
+            if node.get("hop-interval") is not None:
+                extracted["hop_interval"] = validate_hop_interval(node["hop-interval"])
+        elif node.get("hop-interval") is not None:
+            raise SystemExit("the selected Hysteria2 node sets hop-interval without ports")
         for bw_key in ("up", "down"):
             if isinstance(node.get(bw_key), str) and node[bw_key].strip():
                 extracted[bw_key] = node[bw_key].strip()
@@ -386,6 +459,7 @@ def fresh_dns(profile: dict) -> dict:
         "ipv6": ipv6,
         "enhanced-mode": "fake-ip",
         "fake-ip-range": current.get("fake-ip-range", "198.18.0.1/16"),
+        "fake-ip-filter": list(FAKE_IP_FILTER),
         "use-system-hosts": False,
         "use-hosts": bool(profile.get("hosts")),
     }
@@ -568,6 +642,8 @@ def main() -> None:
     p.add_argument("--classic-rules-from", type=Path, help="read domestic DNS hints from a named mainland group in a trusted local profile")
     p.add_argument("--cn-cidrs", type=Path,
                    help="trusted local CIDR text file for an offline Mihomo cn-ip provider")
+    p.add_argument("--hy2-ports", help="optional Mihomo Hysteria2 port-hopping spec (for example 28448,28500-28530)")
+    p.add_argument("--hop-interval", help="optional Mihomo Hysteria2 port-hopping interval in seconds (5..300 or MIN-MAX)")
     args = p.parse_args()
     if os.name == "nt":
         p.error("Generate private profiles in WSL. Keep the order, keys and YML inside the Linux filesystem.")
@@ -575,16 +651,32 @@ def main() -> None:
         p.error("--classic-rules-from requires --classic-android with --mode mobile-cn-split")
     if args.cn_cidrs and (args.mode != "mobile-cn-split" or args.classic_android):
         p.error("--cn-cidrs requires Mihomo --mode mobile-cn-split without --classic-android")
+    if args.classic_android and (args.hy2_ports is not None or args.hop_interval is not None):
+        p.error("--hy2-ports and --hop-interval require Mihomo without --classic-android")
+    if (args.hy2_ports is not None or args.hop_interval is not None) and args.only_node is None and not args.state:
+        p.error("--hy2-ports and --hop-interval require --state or --only-node")
     if args.only_node is not None and (not args.only_node.strip() or args.mode not in ("mobile-cn-split", "mobile-global")
                            or not args.base or args.state or args.base_default):
         p.error("--only-node needs --base with mobile-cn-split or mobile-global, without --state")
     if any(path and args.output.resolve() == path.resolve()
            for path in (args.state, args.base, args.classic_rules_from, args.cn_cidrs)):
         p.error("output must differ from the private state and existing base profile")
+
+    def apply_cli_hy2_overrides(st: dict) -> dict:
+        if args.hy2_ports is not None or args.hop_interval is not None:
+            if st.get("kind") != "hysteria2":
+                p.error("--hy2-ports and --hop-interval only apply to a Hysteria2 state or node")
+            st = dict(st)
+            if args.hy2_ports is not None:
+                st["ports"] = validate_hy2_ports(args.hy2_ports)
+            if args.hop_interval is not None:
+                st["hop_interval"] = validate_hop_interval(args.hop_interval)
+        return st
+
     if args.only_node is not None:
-        state = direct_node_state_from_profile(
+        state = apply_cli_hy2_overrides(direct_node_state_from_profile(
             read_reference_profile(args.base), args.only_node, allow_hysteria2=not args.classic_android
-        )
+        ))
         profile = global_profile(state, args.name)
         if args.mode == "mobile-cn-split":
             profile = mainland_split(profile, args.name, args.classic_android,
@@ -610,7 +702,7 @@ def main() -> None:
     else:
         if not args.state:
             p.error("--state is required for a new profile")
-        state = private_state(args.state)
+        state = apply_cli_hy2_overrides(private_state(args.state))
         if args.classic_android and state.get("kind") == "hysteria2":
             p.error("Hysteria2 requires Mihomo (Clash Meta); omit --classic-android or use a Shadowsocks state")
         if args.mode == "desktop-domains":
