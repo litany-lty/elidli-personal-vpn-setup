@@ -744,6 +744,153 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
             raise AssertionError(f"invalid hysteria2 hop spec accepted: {bad_spec}")
 
 
+def check_vless_reality_and_fixed_exit_relay(directory: Path) -> None:
+    """Verify VLESS-Reality, server-locked fixed-exit relay states, --auto-failover, and small-RAM sysctls."""
+    module = load_client_module("elidli_reality_relay_test")
+    outbound = "Fixed JP exit"
+    relay_reality_state = {
+        "kind": "vless",
+        "server": "198.51.100.20",
+        "exit_server": "192.0.2.10",
+        "port": 443,
+        "uuid": "00000000-0000-4000-8000-000000000001",
+        "sni": "www.icloud.com",
+        "servername": "www.icloud.com",
+        "public_key": "SYNTHETIC_REALITY_PUBLIC_KEY_ONLY_1234567890",
+        "private_key": "MUST_NEVER_APPEAR_IN_CLIENT_YAML",
+        "short_id": "0123456789abcdef",
+    }
+    relay_hy2_state = TEST_HY2_STATE | {
+        "server": "198.51.100.20",
+        "exit_server": "192.0.2.10",
+        "port": 29448,
+    }
+
+    r_node = module.proxy_node(relay_reality_state, "Relay Reality")
+    assert r_node["type"] == "vless" and r_node["port"] == 443
+    assert r_node["flow"] == "xtls-rprx-vision" and r_node["tls"] is True and r_node["udp"] is True
+    assert r_node["reality-opts"] == {
+        "public-key": "SYNTHETIC_REALITY_PUBLIC_KEY_ONLY_1234567890",
+        "short-id": "0123456789abcdef",
+    }
+    assert "MUST_NEVER_APPEAR_IN_CLIENT_YAML" not in json.dumps(r_node)
+
+    # Multi-path fixed-exit chain with --auto-failover: all 4 paths exit via 192.0.2.10, zero DIRECT in groups
+    chain_prof = module.global_profile(
+        TEST_HY2_STATE,
+        outbound,
+        [relay_reality_state, relay_hy2_state, TEST_STATE],
+        auto_failover=True,
+    )
+    assert len(chain_prof["proxies"]) == 4
+    sel_grp, fb_grp = chain_prof["proxy-groups"]
+    assert sel_grp["type"] == "select" and sel_grp["proxies"][0] == f"🔄 {outbound}·自动容灾"
+    assert "DIRECT" not in sel_grp["proxies"]
+    assert fb_grp["type"] == "fallback" and fb_grp["interval"] == 45 and fb_grp["timeout"] == 2500 and fb_grp["lazy"] is True
+    assert len(fb_grp["proxies"]) == 4 and "DIRECT" not in fb_grp["proxies"]
+
+    desk_prof = module.desktop_profile(
+        TEST_HY2_STATE, outbound, ["x.com"], None, None, [relay_reality_state, TEST_STATE], auto_failover=True
+    )
+    desk_fb = next(g for g in desk_prof["proxy-groups"] if g["type"] == "fallback")
+    assert desk_fb["interval"] == 30 and desk_fb["lazy"] is False
+
+    # Extraction via --only-node supports VLESS-Reality on Mihomo and rejects classic Clash
+    extracted_vless = module.direct_node_state_from_profile(
+        {"proxies": [r_node], "proxy-groups": [], "rules": []}, "Relay Reality", allow_hysteria2=True
+    )
+    assert extracted_vless["kind"] == "vless" and extracted_vless["short_id"] == "0123456789abcdef"
+    for invalid_call in (
+        lambda: module.direct_node_state_from_profile({"proxies": [r_node], "proxy-groups": [], "rules": []}, "Relay Reality", allow_hysteria2=False),
+        lambda: module.proxy_node(relay_reality_state | {"short_id": "not-hex!"}, "Bad"),
+        lambda: module.global_profile(TEST_HY2_STATE, outbound, [relay_reality_state | {"exit_server": "203.0.113.99"}]),
+        lambda: module.global_profile(TEST_HY2_STATE, outbound, [{k: v for k, v in relay_reality_state.items() if k != "exit_server"}]),
+    ):
+        try:
+            invalid_call()
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("unsafe VLESS-Reality or mismatched exit_server state was accepted")
+
+    # Verify deploy.py vless-reality plan, sysctls, OOM hardening, and upstream fixed-exit guardrails
+    deploy_spec = importlib.util.spec_from_file_location("elidli_deploy_reality_check", SCRIPTS / "deploy.py")
+    assert deploy_spec and deploy_spec.loader
+    deploy_mod = importlib.util.module_from_spec(deploy_spec)
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        deploy_spec.loader.exec_module(deploy_mod)
+    finally:
+        sys.path.pop(0)
+    for token in (
+        "tcp_slow_start_after_idle = 0",
+        "tcp_notsent_lowat = 16384",
+        "tcp_mtu_probing = 1",
+        "tcp_rmem = 4096 87380 16777216",
+    ):
+        assert token in deploy_mod.SYSCTL_TUNING_BLOCK, f"missing sysctl token {token}"
+    assert "OOMScoreAdjust=-500" in deploy_mod.REMOTE_HY2_SCRIPT
+    assert "OOMScoreAdjust=-500" in deploy_mod.REMOTE_REALITY_SCRIPT
+    assert 'route = {"final": "fixed-exit"}' in deploy_mod.REMOTE_REALITY_SCRIPT
+
+    rl_plan = run(
+        "deploy.py", "plan", "--target", "root@198.51.100.20", "--server", "198.51.100.20",
+        "--service-id", "hk-relay", "--protocol", "vless-reality", "--ensure-swap-mb", "512",
+    )
+    expect_success(rl_plan, "vless-reality deploy plan")
+    rl_data = json.loads(rl_plan.stdout)
+    assert rl_data["protocol"] == "vless-reality" and rl_data["port"] == 443
+    assert rl_data["sni"] == "www.icloud.com" and rl_data["ensure_swap_mb"] == 512
+
+    if os.name != "nt":
+        up_hy2 = directory / "up-jp-hy2.json"
+        up_ss = directory / "up-jp-ss.json"
+        rl_file = directory / "hk-relay-vless.json"
+        up_hy2.write_text(json.dumps(TEST_HY2_STATE), encoding="utf-8")
+        up_ss.write_text(json.dumps(TEST_STATE), encoding="utf-8")
+        rl_file.write_text(json.dumps(relay_reality_state), encoding="utf-8")
+        for f in (up_hy2, up_ss, rl_file):
+            os.chmod(f, 0o600)
+
+        locked_plan = run(
+            "deploy.py", "plan", "--target", "root@198.51.100.20", "--server", "198.51.100.20",
+            "--service-id", "hk-relay-locked", "--protocol", "vless-reality",
+            "--upstream-state", up_hy2, "--upstream-fallback-state", up_ss, "--ensure-swap-mb", "512",
+        )
+        expect_success(locked_plan, "server-locked vless-reality relay plan")
+        locked_data = json.loads(locked_plan.stdout)
+        assert locked_data["exit_server"] == "192.0.2.10"
+        assert any("zero local direct outbound" in c for c in locked_data["changes"])
+
+        # Same host as upstream must fail closed
+        assert run(
+            "deploy.py", "plan", "--target", "root@192.0.2.10", "--server", "192.0.2.10",
+            "--service-id", "bad-self-relay", "--protocol", "vless-reality", "--upstream-state", up_hy2,
+        ).returncode != 0
+
+        chain_out = directory / "phone-chain-failover.yaml"
+        expect_success(
+            run(
+                "client_config.py", "--state", up_hy2,
+                "--fallback-state", rl_file, "--fallback-state", up_ss,
+                "--auto-failover", "--mode", "mobile-cn-split", "--use-x", "--output", chain_out,
+            ),
+            "CLI multi-path fixed-exit --auto-failover generation",
+        )
+        raw_chain = chain_out.read_text(encoding="utf-8")
+        assert "MUST_NEVER_APPEAR_IN_CLIENT_YAML" not in raw_chain
+        chain_written = load_yaml_or_json(chain_out)
+        assert len(chain_written["proxies"]) == 3
+        assert chain_written["proxy-groups"][0]["proxies"][0] == "🔄 个人VPN·固定出口·自动容灾"
+        assert chain_written["proxy-groups"][1]["type"] == "fallback"
+        assert chain_written["dns"]["nameserver"] == ["223.5.5.5", "119.29.29.29"]
+
+        assert run(
+            "client_config.py", "--state", rl_file, "--mode", "mobile-cn-split",
+            "--classic-android", "--output", directory / "bad-classic-vless.yaml",
+        ).returncode != 0, "classic-android accepted VLESS-Reality state"
+
+
 def main() -> int:
     required = (
         "SKILL.md", "README.md", "LICENSE", "references/data-sources.md",
@@ -769,12 +916,14 @@ def main() -> int:
         check_order_state(directory)
         check_dual_core_generation(directory)
         check_hysteria2_and_deploy_plan(directory)
+        check_vless_reality_and_fixed_exit_relay(directory)
         client_result = check_client_generation(directory)
     print("PASS: package layout, catalog recommendation, legacy ID and ready order state")
     print("PASS: X intent adds four prioritized, de-duplicated rules and preserves other routes")
     print("PASS: single-exit generation excludes unrelated nodes, chains and providers")
     print("PASS: classic and Mihomo mobile profiles enforce their DNS and mainland-IP contracts")
     print("PASS: Hysteria2 parallel plan, Mihomo profile pinning and classic-core guardrails")
+    print("PASS: VLESS-Reality server-locked fixed-exit relay, multi-path --auto-failover, and small-RAM sysctls")
     print(f"Private CLI profiles: {client_result}")
     print("No network, SSH, VPN or system-proxy action was performed.")
     return 0

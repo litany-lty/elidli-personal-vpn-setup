@@ -13,7 +13,7 @@
 如已安装 Git，可在项目根目录直接安装当前发布版本。在本机新建技能目录后，执行：
 
 ```sh
-git clone --depth 1 --branch v1.5.5 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
+git clone --depth 1 --branch v1.6.0 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
 ```
 
 从旧版升级时，将名称为 `personal-vpn-setup` 的旧 Skill 目录移出 Codex 扫描路径，避免出现两个入口。既有服务器服务名和密钥状态目录沿用原有位置。
@@ -40,7 +40,7 @@ Windows PowerShell 将开头的 `python3` 换成 `py -3 -X utf8`。自检输出 
 | 目的 | 环境和要求 |
 |---|---|
 | 查价、读报价 ID 和记录订单 | Python 3.10+。macOS、Linux 和 Windows 原生可走此路径。已有服务的发票、账户和真实凭据保存在自己的数据目录。 |
-| 自动部署自己的服务器 | 从 macOS、Linux 或 WSL 调用 OpenSSH。目标是有公网 IPv4、systemd 的 Debian/Ubuntu VPS，支持默认 `Shadowsocks` 及针对跨国高丢包普通线路的 `Hysteria2`（可独立端口无损并存）。先从商家控制台核对 SSH 主机指纹。root 登录时给检查与部署命令都加 `--remote-root`，普通账号使用免密 `sudo -n`。 |
+| 自动部署自己的服务器 | 从 macOS、Linux 或 WSL 调用 OpenSSH。目标是有公网 IPv4、systemd 的 Debian/Ubuntu VPS，支持默认 `Shadowsocks`、抗高丢包的 `Hysteria2` 及抗 UDP 限速与服务端锁死固定出口中转的 `VLESS-Reality`（可独立端口无损并存，支持 512 MB 小内存 Swap/TCP 扩窗加固）。先从商家控制台核对 SSH 主机指纹。root 登录时给检查与部署命令都加 `--remote-root`，普通账号使用免密 `sudo -n`。 |
 | 生成手机和电脑配置 | 在 macOS、Linux 或 WSL 的私有目录生成。Windows 使用 WSL 时把密钥、订单和 YML 放在 WSL 的 Linux 文件系统。新配置只需标准库。读取已有 YAML、继承已有节点或域名规则需要 PyYAML。 |
 | 手机实际使用 | Android 经典 Clash 与 Mihomo 各用对应配置。中国大陆常用方式是国内直连、国外走选定代理。明确选择链式备用时，经典 Clash 使用 TCP relay，Mihomo 使用 dialer-proxy。设备需要授予系统 VPN 权限并选择规则模式。iOS 和路由器需按具体客户端手动适配。 |
 | 电脑按站点分流 | 可指定 X 或其他域名，只改变匹配站点的出口。已有桌面配置可生成独立副本，验收时应分别查看目标站点与普通站点的实际连接。 |

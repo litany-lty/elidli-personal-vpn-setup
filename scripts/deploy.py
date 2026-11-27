@@ -23,9 +23,321 @@ except ImportError:  # Native Windows; use this workflow from WSL instead.
     fcntl = None
 
 
-PROTOCOLS = ("ss", "hysteria2")
+PROTOCOLS = ("ss", "hysteria2", "vless-reality")
 METHODS = ("aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305")
 OUTBOUND_MODES = ("auto-detect", "auto", "4", "6", "46", "64")
+SYSCTL_TUNING_BLOCK = r'''cat >/etc/sysctl.d/99-personal-vpn-quic.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+EOF
+'''
+SWAP_HELPER_BLOCK = r'''swap_mb=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("ensure_swap_mb") or 0))' "$bundle")
+if [ "$swap_mb" -gt 0 ] && ! swapon --show | grep -q . ; then
+  if [ ! -f /swapfile ]; then
+    fallocate -l "${swap_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none
+  fi
+  chmod 0600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  printf '\nvm.swappiness = 10\n' >> /etc/sysctl.d/99-personal-vpn-quic.conf
+fi
+sysctl --system >/dev/null 2>&1 || true
+'''
+REMOTE_REALITY_SCRIPT = r'''set -eu
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+umask 077
+bundle=$1
+service_id=$2
+service="personal-vpn-${service_id}"
+config="/etc/sing-box/${service}.json"
+unit="/etc/systemd/system/${service}.service"
+account="personal-vpn-sb"
+
+exec 9>"/run/lock/${service}.lock"
+flock -n 9 || { echo "another deployment is already running for ${service}" >&2; exit 1; }
+
+cleanup() { rm -f "$bundle" "$config.new" "$unit.new"; }
+trap cleanup EXIT
+
+python3 - "$bundle" "$config" "$unit" <<'PY'
+import hashlib, json, pathlib, sys
+bundle, config_path, unit_path = map(pathlib.Path, sys.argv[1:])
+d = json.loads(bundle.read_text())
+expected = d.pop("_expected_remote")
+config_exists, unit_exists = config_path.exists(), unit_path.exists()
+if expected["state"] == "missing":
+    if config_exists or unit_exists:
+        raise SystemExit("same-name remote service appeared after preflight")
+elif expected["state"] == "present":
+    if not config_exists or not unit_exists:
+        raise SystemExit("same-name remote service became incomplete after preflight")
+    cur = json.loads(config_path.read_text())
+    inb = (cur.get("inbounds") or [{}])[0]
+    usr = (inb.get("users") or [{}])[0]
+    tls = inb.get("tls") or {}
+    rl = tls.get("reality") or {}
+    comparable = {
+        "port": int(inb.get("listen_port") or 0),
+        "private_key": rl.get("private_key") or "",
+        "short_id": (rl.get("short_id") or [""])[0],
+        "sni": (tls.get("server_name") or "").lower(),
+        "uuid": usr.get("uuid") or "",
+    }
+    digest = hashlib.sha256(json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if digest != expected["fingerprint"]:
+        raise SystemExit("same-name remote service changed after preflight")
+else:
+    raise SystemExit("invalid expected remote state")
+PY
+
+os_id=$(. /etc/os-release; printf '%s' "$ID")
+case "$os_id" in debian|ubuntu) ;; *) echo "supported remote OS is Debian or Ubuntu" >&2; exit 1;; esac
+
+need_pkgs=""
+[ -f /etc/ssl/certs/ca-certificates.crt ] || need_pkgs="$need_pkgs ca-certificates"
+command -v tar >/dev/null 2>&1 || need_pkgs="$need_pkgs tar"
+if [ -n "$need_pkgs" ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 update >/dev/null
+  # shellcheck disable=SC2086
+  apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -y --no-install-recommends install $need_pkgs >/dev/null
+fi
+''' + SYSCTL_TUNING_BLOCK + SWAP_HELPER_BLOCK + r'''
+if [ ! -x /usr/local/bin/sing-box ]; then
+  python3 - <<'PY'
+import hashlib, json, os, platform, tarfile, tempfile, urllib.request
+machine = platform.machine().lower()
+arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+if not arch:
+    raise SystemExit(f"unsupported remote CPU architecture for sing-box: {machine}")
+headers = {"User-Agent": "elidli-personal-vpn-setup"}
+rel_req = urllib.request.Request("https://api.github.com/repos/SagerNet/sing-box/releases/latest", headers=headers)
+rel = json.loads(urllib.request.urlopen(rel_req, timeout=20).read().decode())
+tag = rel["tag_name"]
+ver = tag.lstrip("v")
+tar_name = f"sing-box-{ver}-linux-{arch}.tar.gz"
+base = f"https://github.com/SagerNet/sing-box/releases/download/{tag}"
+tar_bytes = urllib.request.urlopen(urllib.request.Request(f"{base}/{tar_name}", headers=headers), timeout=90).read()
+expected = ""
+for asset in rel.get("assets") or []:
+    if asset.get("name") == tar_name and str(asset.get("digest", "")).startswith("sha256:"):
+        expected = str(asset["digest"]).split(":", 1)[1].lower()
+        break
+if not expected:
+    for chk_name in (f"sing-box-{ver}-checksums.txt", "checksums.txt"):
+        try:
+            chk = urllib.request.urlopen(urllib.request.Request(f"{base}/{chk_name}", headers=headers), timeout=20).read().decode()
+            expected = next((p[0].lower() for line in chk.splitlines() if len(p := line.split()) >= 2 and p[1].endswith(tar_name)), "")
+            if expected:
+                break
+        except Exception:
+            pass
+if expected and hashlib.sha256(tar_bytes).hexdigest().lower() != expected:
+    raise SystemExit("sing-box archive SHA-256 verification failed")
+with tempfile.TemporaryDirectory() as td:
+    tp = os.path.join(td, tar_name)
+    with open(tp, "wb") as fh:
+        fh.write(tar_bytes)
+    with tarfile.open(tp, "r:gz") as tf:
+        member = next((m for m in tf.getmembers() if m.isfile() and m.name.endswith("/sing-box")), None)
+        if not member:
+            raise SystemExit("sing-box binary missing inside official archive")
+        extracted = tf.extractfile(member)
+        assert extracted is not None
+        data = extracted.read()
+tmp = "/usr/local/bin/.sing-box.new"
+with open(tmp, "wb") as handle:
+    handle.write(data)
+os.chmod(tmp, 0o755)
+os.replace(tmp, "/usr/local/bin/sing-box")
+PY
+fi
+
+getent passwd "$account" >/dev/null 2>&1 || adduser --system --group --no-create-home --home /nonexistent --shell /usr/sbin/nologin "$account" >/dev/null 2>&1 || useradd -r -U -s /usr/sbin/nologin -M "$account"
+install -d -m 0750 -o root -g "$account" /etc/sing-box
+
+python3 - "$bundle" "$config.new" "$unit.new" "$service" <<'PY'
+import json, pathlib, subprocess, sys
+bundle_path, config_path, unit_path, service = sys.argv[1:]
+d = json.loads(pathlib.Path(bundle_path).read_text())
+uuid = d.get("uuid") or subprocess.check_output(["/usr/local/bin/sing-box", "generate", "uuid"], text=True).strip()
+priv = d.get("private_key")
+pub = d.get("public_key")
+if not priv or not pub:
+    kp = subprocess.check_output(["/usr/local/bin/sing-box", "generate", "reality-keypair"], text=True)
+    kv = {line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip() for line in kp.splitlines() if ":" in line}
+    priv, pub = kv["PrivateKey"], kv["PublicKey"]
+short_id = d["short_id"]
+sni = d["sni"]
+
+def build_upstream_outbound(spec: dict, tag: str) -> dict:
+    kind = spec.get("kind", "ss")
+    if kind == "hysteria2":
+        up = int(str(spec.get("up", "30 mbps")).split()[0]) if spec.get("up") else 30
+        down = int(str(spec.get("down", "150 mbps")).split()[0]) if spec.get("down") else 150
+        return {
+            "type": "hysteria2", "tag": tag,
+            "server": spec["server"], "server_port": int(spec["port"]),
+            "up_mbps": up, "down_mbps": down,
+            "password": spec["password"],
+            "tls": {"enabled": True, "server_name": spec.get("sni", "www.bing.com"), "insecure": bool(spec.get("skip_cert_verify", True)), "alpn": ["h3"]},
+        }
+    return {
+        "type": "shadowsocks", "tag": tag,
+        "server": spec["server"], "server_port": int(spec["port"]),
+        "method": spec["method"], "password": spec["password"],
+    }
+
+upstream = d.get("_upstream")
+upstream_fb = d.get("_upstream_fallback")
+if upstream:
+    # Hard-locked fixed-exit relay: ZERO local direct outbound in outbounds list
+    if upstream_fb:
+        outbounds = [
+            {
+                "type": "urltest", "tag": "fixed-exit",
+                "outbounds": ["upstream-primary", "upstream-fallback"],
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "30s", "tolerance": 80, "idle_timeout": "30m",
+            },
+            build_upstream_outbound(upstream, "upstream-primary"),
+            build_upstream_outbound(upstream_fb, "upstream-fallback"),
+        ]
+    else:
+        outbounds = [build_upstream_outbound(upstream, "fixed-exit")]
+    route = {"final": "fixed-exit"}
+else:
+    outbounds = [{"type": "direct", "tag": "direct"}]
+    route = {"final": "direct"}
+
+cfg = {
+    "log": {"level": "warn", "timestamp": True},
+    "inbounds": [{
+        "type": "vless", "tag": "vless-reality-in",
+        "listen": "::", "listen_port": int(d["port"]),
+        "users": [{"uuid": uuid, "flow": "xtls-rprx-vision"}],
+        "tls": {
+            "enabled": True, "server_name": sni,
+            "reality": {
+                "enabled": True,
+                "handshake": {"server": sni, "server_port": 443},
+                "private_key": priv,
+                "short_id": [short_id],
+            },
+        },
+    }],
+    "outbounds": outbounds,
+    "route": route,
+}
+pathlib.Path(config_path).write_text(json.dumps(cfg, indent=2) + "\n")
+unit = f"""[Unit]
+Description=Private VLESS-Reality service ({service})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personal-vpn-sb
+Group=personal-vpn-sb
+OOMScoreAdjust=-500
+LimitNOFILE=65535
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/{service}.json
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+"""
+pathlib.Path(unit_path).write_text(unit)
+pathlib.Path(f"{config_path}.meta").write_text(json.dumps({"uuid": uuid, "private_key": priv, "public_key": pub}))
+PY
+meta_json=$(cat "$config.new.meta"); rm -f "$config.new.meta"
+/usr/local/bin/sing-box check -c "$config.new"
+chown root:"$account" "$config.new"
+chmod 0640 "$config.new"
+chmod 0644 "$unit.new"
+
+stamp=$(date +%Y%m%d%H%M%S)
+old_active=0; old_enabled=0
+systemctl is-active --quiet "$service" && old_active=1 || true
+systemctl is-enabled --quiet "$service" && old_enabled=1 || true
+had_config=0; had_unit=0
+[ ! -e "$config" ] || had_config=1
+[ ! -e "$unit" ] || had_unit=1
+[ ! -e "$config" ] || cp -p "$config" "${config}.rollback-${stamp}"
+[ ! -e "$unit" ] || cp -p "$unit" "${unit}.rollback-${stamp}"
+restore() {
+  systemctl stop "$service" >/dev/null 2>&1 || true
+  [ "$old_enabled" -eq 1 ] || systemctl disable "$service" >/dev/null 2>&1 || true
+  if [ "$had_config" -eq 1 ]; then mv -f "${config}.rollback-${stamp}" "$config"; else rm -f "$config"; fi
+  if [ "$had_unit" -eq 1 ]; then mv -f "${unit}.rollback-${stamp}" "$unit"; else rm -f "$unit"; fi
+  systemctl daemon-reload
+  [ "$old_enabled" -eq 0 ] || systemctl enable "$service" >/dev/null 2>&1 || true
+  [ "$old_active" -eq 0 ] || systemctl start "$service" >/dev/null 2>&1 || true
+}
+finish_replacement() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  [ "$rc" -eq 0 ] || restore
+  cleanup
+  exit "$rc"
+}
+trap finish_replacement EXIT
+trap 'exit 1' HUP INT TERM
+mv "$config.new" "$config"
+mv "$unit.new" "$unit"
+systemctl daemon-reload
+if ! systemctl enable "$service" >/dev/null || ! systemctl restart "$service" || ! systemctl is-active --quiet "$service"; then
+  echo "activation failed; restoring previous service" >&2
+  exit 1
+fi
+listen_port=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$bundle")
+listeners=""
+i=0
+while [ "$i" -lt 30 ]; do
+  main_pid=$(systemctl show "$service" -p MainPID --value)
+  listener_lines=$(ss -H -lntup "sport = :${listen_port}")
+  listeners=$(printf '%s\n' "$listener_lines" | awk -v pid="pid=${main_pid}," 'index($0,pid) {print $1}' | sort -u | paste -sd, -)
+  case ",$listeners," in *,tcp,*) break;; esac
+  i=$((i + 1)); sleep 0.1
+done
+case ",$listeners," in
+  *,tcp,*) ;;
+  *)
+    echo "missing TCP listener; restoring previous service" >&2
+    exit 1
+    ;;
+esac
+trap cleanup EXIT
+trap - HUP INT TERM
+rm -f "${config}.rollback-${stamp}" "${unit}.rollback-${stamp}"
+svc_state=$(systemctl show "$service" -p ActiveState -p SubState -p NRestarts -p User --value | paste -sd, -)
+python3 -c 'import json,sys; m=json.loads(sys.argv[3]); print(json.dumps({"service": sys.argv[1], "listeners": sys.argv[2], **m}))' "$svc_state" "$listeners" "$meta_json"
+'''
 REMOTE_HY2_SCRIPT = r'''set -eu
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 umask 077
@@ -117,14 +429,7 @@ if [ -n "$need_pkgs" ]; then
   apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -y --no-install-recommends install $need_pkgs >/dev/null
 fi
 
-cat >/etc/sysctl.d/99-personal-vpn-quic.conf <<'EOF'
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-EOF
-sysctl --system >/dev/null 2>&1 || true
-
+''' + SYSCTL_TUNING_BLOCK + SWAP_HELPER_BLOCK + r'''
 if [ ! -x /usr/local/bin/hysteria ]; then
   python3 - <<'PY'
 import hashlib, json, os, platform, urllib.request
@@ -234,6 +539,8 @@ Wants=network-online.target{wants_hop}
 Type=simple
 User=personal-vpn-hy2
 Group=personal-vpn-hy2
+OOMScoreAdjust=-500
+LimitNOFILE=65535
 ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/{service}.yaml
 Restart=on-failure
 RestartSec=3s
@@ -579,8 +886,8 @@ def service_id(value: str) -> str:
 
 def port(value: str) -> int:
     parsed = int(value)
-    if not 1024 <= parsed <= 65535:
-        raise argparse.ArgumentTypeError("port must be between 1024 and 65535")
+    if parsed != 443 and not 1024 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("port must be 443 or between 1024 and 65535")
     return parsed
 
 
@@ -670,6 +977,20 @@ def remote_service_fingerprint(args: argparse.Namespace) -> tuple[str, str | Non
             "print('missing' if not c.exists() and not u.exists() else "
             "('partial' if not c.exists() or not u.exists() else "
             "'present '+hashlib.sha256(json.dumps({'password':mw.group(1) if mw else '','port':int(mp.group(1)) if mp else 0,'sni':ms.group(1).lower() if ms else ''},"
+            "sort_keys=True,separators=(',',':')).encode()).hexdigest()))"
+        )
+    elif args.protocol == "vless-reality":
+        config = f"/etc/sing-box/{service}.json"
+        code = (
+            "import hashlib,json,pathlib,sys; c=pathlib.Path(sys.argv[1]); u=pathlib.Path(sys.argv[2]); "
+            "d=json.loads(c.read_text()) if c.exists() else {}; "
+            "inb=(d.get('inbounds') or [{}])[0]; usr=(inb.get('users') or [{}])[0]; "
+            "tls=inb.get('tls') or {}; rl=tls.get('reality') or {}; "
+            "print('missing' if not c.exists() and not u.exists() else "
+            "('partial' if not c.exists() or not u.exists() else "
+            "'present '+hashlib.sha256(json.dumps({'port':int(inb.get('listen_port') or 0),"
+            "'private_key':rl.get('private_key') or '','short_id':(rl.get('short_id') or [''])[0],"
+            "'sni':(tls.get('server_name') or '').lower(),'uuid':usr.get('uuid') or ''},"
             "sort_keys=True,separators=(',',':')).encode()).hexdigest()))"
         )
     else:
@@ -774,8 +1095,46 @@ def apply_hy2_runtime_options(state: dict[str, object], args: argparse.Namespace
         state.pop("hop_range", None)
 
 
+def load_upstream_spec(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != 0o600:
+        raise SystemExit(f"refusing upstream state file {path} with mode {mode:o}; require 600")
+    spec = json.loads(path.read_text())
+    kind = spec.get("kind", "ss")
+    if kind not in ("ss", "hysteria2"):
+        raise SystemExit("upstream fixed-exit state must have kind 'ss' or 'hysteria2'")
+    if not isinstance(spec.get("server"), str) or not spec["server"].strip() or type(spec.get("port")) is not int:
+        raise SystemExit("upstream fixed-exit state is missing server or integer port")
+    if not isinstance(spec.get("password"), str) or not spec["password"]:
+        raise SystemExit("upstream fixed-exit state is missing password")
+    if kind == "ss" and not isinstance(spec.get("method"), str):
+        raise SystemExit("upstream ss state is missing method")
+    return spec
+
+
+def validate_upstream_pair(args: argparse.Namespace) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    up = load_upstream_spec(args.upstream_state)
+    up_fb = load_upstream_spec(args.upstream_fallback_state)
+    if up_fb is not None and up is None:
+        raise SystemExit("--upstream-fallback-state requires --upstream-state")
+    if up is not None:
+        if str(up["server"]).strip().lower() == args.server.strip().lower():
+            raise SystemExit("relay --server cannot be the same host as --upstream-state")
+        if up_fb is not None:
+            if str(up["server"]).strip().lower() != str(up_fb["server"]).strip().lower():
+                raise SystemExit("--upstream-fallback-state must share the exact same exit server as --upstream-state")
+            if (up.get("kind", "ss"), up["port"]) == (up_fb.get("kind", "ss"), up_fb["port"]):
+                raise SystemExit("--upstream-fallback-state must differ in protocol or port from --upstream-state")
+    return up, up_fb
+
+
 def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     """Load an existing validated state or synthesize a new in-memory state without writing prematurely."""
+    normalize_parsed_args(args)
+    up, _ = validate_upstream_pair(args)
+    expected_kind = "vless" if args.protocol == "vless-reality" else args.protocol
     path = state_file(args)
     args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(args.state_dir, 0o700)
@@ -785,8 +1144,8 @@ def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             raise SystemExit(f"refusing state file with mode {mode:o}; require 600")
         state = json.loads(path.read_text())
         existing_kind = state.get("kind", "ss")
-        if existing_kind != args.protocol:
-            raise SystemExit(f"existing state protocol {existing_kind!r} differs from {args.protocol!r}; choose a new --service-id")
+        if existing_kind != expected_kind:
+            raise SystemExit(f"existing state protocol {existing_kind!r} differs from {expected_kind!r}; choose a new --service-id")
         checks: list[tuple[str, object]] = [("service_id", args.service_id), ("server", args.server), ("port", args.listen_port)]
         if args.protocol == "ss":
             checks.append(("method", args.method))
@@ -797,6 +1156,14 @@ def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
                 raise SystemExit(f"existing state differs at {key}; choose a new service id or use explicit rotation workflow")
         if args.protocol == "hysteria2":
             apply_hy2_runtime_options(state, args)
+        if up is not None:
+            state["exit_server"] = str(up["server"]).strip()
+        else:
+            state.pop("exit_server", None)
+        if args.ensure_swap_mb > 0:
+            state["ensure_swap_mb"] = args.ensure_swap_mb
+        else:
+            state.pop("ensure_swap_mb", None)
         return state, True
     if args.protocol == "hysteria2":
         state: dict[str, object] = {
@@ -805,12 +1172,23 @@ def prepare_state(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
             "password": secrets.token_urlsafe(24), "sni": args.sni,
         }
         apply_hy2_runtime_options(state, args)
+    elif args.protocol == "vless-reality":
+        state = {
+            "version": 1, "kind": "vless", "service_id": args.service_id,
+            "server": args.server, "port": args.listen_port,
+            "sni": args.sni, "servername": args.sni,
+            "short_id": secrets.token_hex(8),
+        }
     else:
         state = {
             "version": 1, "service_id": args.service_id, "server": args.server,
             "port": args.listen_port, "method": args.method,
             "password": secrets.token_urlsafe(32),
         }
+    if up is not None:
+        state["exit_server"] = str(up["server"]).strip()
+    if args.ensure_swap_mb > 0:
+        state["ensure_swap_mb"] = args.ensure_swap_mb
     return state, False
 
 
@@ -828,8 +1206,8 @@ def inspect(args: argparse.Namespace) -> None:
         "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; "
         "set -eu; . /etc/os-release; "
         "printf '{\"id\":\"%s\",\"version\":\"%s\",' \"$ID\" \"$VERSION_ID\"; "
-        "printf '\"ss_server\":\"%s\",\"hysteria\":\"%s\",\"rmem_max\":\"%s\",\"service\":\"%s\"}\\n' "
-        "\"$(command -v ss-server || true)\" \"$(command -v hysteria || true)\" "
+        "printf '\"ss_server\":\"%s\",\"hysteria\":\"%s\",\"sing_box\":\"%s\",\"rmem_max\":\"%s\",\"service\":\"%s\"}\\n' "
+        "\"$(command -v ss-server || true)\" \"$(command -v hysteria || true)\" \"$(command -v sing-box || true)\" "
         "\"$(sysctl -n net.core.rmem_max 2>/dev/null || true)\" "
         "\"$(systemctl is-active personal-vpn-" + args.service_id + " 2>/dev/null || true)\""
     )
@@ -840,25 +1218,55 @@ def inspect(args: argparse.Namespace) -> None:
 
 
 def plan(args: argparse.Namespace) -> None:
+    normalize_parsed_args(args)
+    up, up_fb = validate_upstream_pair(args)
     if args.protocol == "hysteria2":
         changes = [
             "verify and install official Hysteria2 binary via SHA-256 if absent",
-            "tune QUIC UDP kernel buffers in /etc/sysctl.d/99-personal-vpn-quic.conf",
+            "tune QUIC UDP + BBR TCP kernel buffers in /etc/sysctl.d/99-personal-vpn-quic.conf",
             "create one system account and self-signed P-256 certificate with pinned SHA-256 fingerprint",
-            f"write one isolated config (outbound mode: {args.outbound_mode}) and systemd unit on UDP port without touching existing Shadowsocks ports",
+            f"write one isolated config (outbound mode: {args.outbound_mode}) and OOM-hardened systemd unit on UDP port without touching existing Shadowsocks ports",
             "enable and start that unit",
         ]
+        if args.ensure_swap_mb > 0:
+            changes.insert(2, f"ensure {args.ensure_swap_mb} MB /swapfile (vm.swappiness=10) if host has no active swap")
         if args.hop_ports:
-            changes.insert(4, f"install isolated UDP port-hopping redirect ({args.hop_ports[0]}-{args.hop_ports[1]} -> {args.listen_port})")
+            changes.insert(len(changes) - 1, f"install isolated UDP port-hopping redirect ({args.hop_ports[0]}-{args.hop_ports[1]} -> {args.listen_port})")
         summary: dict[str, object] = {
             "target": args.target, "service": f"personal-vpn-{args.service_id}",
             "protocol": "hysteria2", "server": args.server, "port": args.listen_port,
             "sni": args.sni, "up_mbps": args.up_mbps, "down_mbps": args.down_mbps,
             "outbound_mode": args.outbound_mode,
+            "ensure_swap_mb": args.ensure_swap_mb or None,
             "hop_ports": f"{args.hop_ports[0]}-{args.hop_ports[1]}" if args.hop_ports else None,
             "hop_interval": args.hop_interval if args.hop_ports else None,
             "changes": changes,
             "unchanged": ["SSH policy", "global firewall", "other services and ports (e.g. 28447)", "OS installation"],
+        }
+    elif args.protocol == "vless-reality":
+        exit_desc = (
+            f"hard-locked to fixed exit {up['server']} ({up.get('kind', 'ss')}:{up['port']}"
+            + (f" + fallback {up_fb.get('kind', 'ss')}:{up_fb['port']}" if up_fb else "")
+            + ", zero local direct outbound)"
+            if up else "direct exit"
+        )
+        changes = [
+            "verify and install official sing-box binary via SHA-256 if absent",
+            "tune 16 MB TCP/UDP BBR + MTU probing + idle-cwnd sysctls in /etc/sysctl.d/99-personal-vpn-quic.conf",
+            "create one system account and Reality X25519 keypair + UUID",
+            f"write one isolated VLESS-Reality TCP config ({exit_desc}) and OOM-hardened systemd unit",
+            "enable and start that unit",
+        ]
+        if args.ensure_swap_mb > 0:
+            changes.insert(2, f"ensure {args.ensure_swap_mb} MB /swapfile (vm.swappiness=10) if host has no active swap")
+        summary = {
+            "target": args.target, "service": f"personal-vpn-{args.service_id}",
+            "protocol": "vless-reality", "server": args.server, "port": args.listen_port,
+            "sni": args.sni,
+            "exit_server": str(up["server"]) if up else None,
+            "ensure_swap_mb": args.ensure_swap_mb or None,
+            "changes": changes,
+            "unchanged": ["SSH policy", "global firewall", "other services and ports", "OS installation"],
         }
     else:
         summary = {
@@ -873,6 +1281,8 @@ def plan(args: argparse.Namespace) -> None:
 def deploy(args: argparse.Namespace) -> None:
     if fcntl is None:
         raise SystemExit("Run deployment from macOS, Linux, or WSL with OpenSSH.")
+    normalize_parsed_args(args)
+    up, up_fb = validate_upstream_pair(args)
     verify_order(args)
     ensure_ssh(args)
     with state_lock(args):
@@ -886,6 +1296,14 @@ def deploy(args: argparse.Namespace) -> None:
         if remote_state == "present":
             if args.protocol == "hysteria2":
                 comparable: dict[str, object] = {"password": state["password"], "port": state["port"], "sni": str(state["sni"]).lower()}
+            elif args.protocol == "vless-reality":
+                comparable = {
+                    "port": state["port"],
+                    "private_key": state.get("private_key") or "",
+                    "short_id": state.get("short_id") or "",
+                    "sni": str(state["sni"]).lower(),
+                    "uuid": state.get("uuid") or "",
+                }
             else:
                 comparable = {"password": state["password"], "server_port": state["port"], "method": state["method"]}
             local_hash = hashlib.sha256(json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -893,6 +1311,10 @@ def deploy(args: argparse.Namespace) -> None:
                 raise SystemExit("remote service credential differs from local state; refusing to overwrite")
         bundle = dict(state)
         bundle["_expected_remote"] = {"state": remote_state, "fingerprint": remote_hash}
+        if up is not None:
+            bundle["_upstream"] = up
+        if up_fb is not None:
+            bundle["_upstream_fallback"] = up_fb
         remote_bundle = f"/var/tmp/personal-vpn-{args.service_id}-{secrets.token_hex(6)}.json"
         prefix = remote_root_prefix(args)
         upload = prefix + "sh -c " + shlex.quote(f"umask 077; cat > {remote_bundle}")
@@ -900,7 +1322,11 @@ def deploy(args: argparse.Namespace) -> None:
         if result.returncode:
             raise SystemExit("could not stage private deployment data: " + result.stderr.decode(errors="replace"))
         remote = prefix + "bash -s -- " + shlex.quote(remote_bundle) + " " + shlex.quote(args.service_id)
-        script_body = REMOTE_HY2_SCRIPT if args.protocol == "hysteria2" else REMOTE_SCRIPT
+        script_body = (
+            REMOTE_HY2_SCRIPT if args.protocol == "hysteria2"
+            else REMOTE_REALITY_SCRIPT if args.protocol == "vless-reality"
+            else REMOTE_SCRIPT
+        )
         try:
             result = run_ssh(args, remote, data=script_body.encode())
         finally:
@@ -911,6 +1337,11 @@ def deploy(args: argparse.Namespace) -> None:
         if args.protocol == "hysteria2":
             meta = json.loads(remote_out.splitlines()[-1])
             state["fingerprint"] = meta["fingerprint"]
+        elif args.protocol == "vless-reality":
+            meta = json.loads(remote_out.splitlines()[-1])
+            state["uuid"] = meta["uuid"]
+            state["public_key"] = meta["public_key"]
+            state["private_key"] = meta["private_key"]
         write_state_atomic(local_path, args.state_dir, args.service_id, state)
         print(json.dumps({"status": "deployed", "protocol": args.protocol, "state_file": str(local_path), "remote": remote_out}, ensure_ascii=False))
 
@@ -955,11 +1386,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--target", type=ssh_target, required=True, help="OpenSSH target or Host alias")
     p.add_argument("--server", required=True, help="public IP or hostname clients will use")
     p.add_argument("--service-id", type=service_id, required=True)
-    p.add_argument("--protocol", choices=PROTOCOLS, default="ss", help="ss (TCP+UDP, widest compatibility) or hysteria2 (QUIC/UDP for high-loss links, Mihomo)")
-    p.add_argument("--listen-port", type=port, default=None, help="defaults to 28447 for ss, 28448 for hysteria2")
+    p.add_argument("--protocol", choices=PROTOCOLS, default="ss", help="ss (TCP+UDP), hysteria2 (QUIC/UDP for high-loss links), or vless-reality (TCP/443 anti-UDP-QoS & fixed-exit relay)")
+    p.add_argument("--listen-port", type=port, default=None, help="defaults to 28447 for ss, 28448 for hysteria2, 443 for vless-reality")
     p.add_argument("--method", choices=METHODS, default="aes-128-gcm")
-    p.add_argument("--sni", type=sni_hostname, default="www.bing.com", help="TLS SNI/masquerade domain for hysteria2")
+    p.add_argument("--sni", type=sni_hostname, default=None, help="TLS SNI/masquerade domain (defaults to www.bing.com for hysteria2, www.icloud.com for vless-reality)")
     p.add_argument("--outbound-mode", choices=OUTBOUND_MODES, default="auto-detect", help="direct outbound IP mode for hysteria2 (auto-detect sets 4 on IPv4-only hosts)")
+    p.add_argument("--upstream-state", type=Path, default=None, help="optional mode-600 fixed-exit state to hard-lock a vless-reality relay server to one target exit IP (zero local direct outbound)")
+    p.add_argument("--upstream-fallback-state", type=Path, default=None, help="optional mode-600 companion state on the same fixed-exit server for relay upstream failover")
+    p.add_argument("--ensure-swap-mb", type=int, default=0, help="optional swapfile size in MiB (e.g. 512) to provision when a small-RAM VPS has 0 swap")
     p.add_argument("--hop-ports", type=hop_port_range, default=None, help="optional UDP port-hopping range START-END for hysteria2 (leave unset by default behind Cone NAT unless verified)")
     p.add_argument("--hop-interval", type=hop_interval_seconds, default=25, help="client UDP port-hopping interval in seconds when --hop-ports is set")
     p.add_argument("--up-mbps", type=bandwidth_mbps, default=15, help="client upload hint in Mbps for hysteria2 Brutal (0 for QUIC BBR)")
@@ -974,10 +1408,24 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-if __name__ == "__main__":
-    ns = parser().parse_args()
+def normalize_parsed_args(ns: argparse.Namespace) -> argparse.Namespace:
     if ns.protocol != "hysteria2" and (ns.hop_ports is not None or ns.outbound_mode != "auto-detect"):
         raise SystemExit("--hop-ports and --outbound-mode are only supported with --protocol hysteria2")
+    if ns.protocol != "vless-reality" and (ns.upstream_state is not None or ns.upstream_fallback_state is not None):
+        raise SystemExit("--upstream-state and --upstream-fallback-state require --protocol vless-reality")
+    if ns.ensure_swap_mb < 0 or ns.ensure_swap_mb > 8192:
+        raise SystemExit("--ensure-swap-mb must be between 0 and 8192")
+    if ns.protocol == "ss" and ns.ensure_swap_mb > 0:
+        raise SystemExit("--ensure-swap-mb is supported with --protocol hysteria2 or vless-reality")
+    if ns.sni is None:
+        ns.sni = "www.icloud.com" if ns.protocol == "vless-reality" else "www.bing.com"
     if ns.listen_port is None:
-        ns.listen_port = 28448 if ns.protocol == "hysteria2" else 28447
+        ns.listen_port = 443 if ns.protocol == "vless-reality" else (28448 if ns.protocol == "hysteria2" else 28447)
+    if ns.listen_port == 443 and ns.protocol != "vless-reality":
+        raise SystemExit("port 443 requires --protocol vless-reality (or choose 1024..65535)")
+    return ns
+
+
+if __name__ == "__main__":
+    ns = normalize_parsed_args(parser().parse_args())
     {"plan": plan, "inspect": inspect, "deploy": deploy}[ns.action](ns)

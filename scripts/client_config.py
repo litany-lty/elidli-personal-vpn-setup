@@ -171,8 +171,39 @@ def proxy_node(state: dict, name: str) -> dict:
             if isinstance(state.get(bw_key), str) and state[bw_key].strip():
                 node[bw_key] = state[bw_key].strip()
         return node
+    if kind == "vless":
+        uuid = state.get("uuid")
+        servername = state.get("servername") or state.get("sni")
+        ropts = state.get("reality-opts") if isinstance(state.get("reality-opts"), dict) else {}
+        pub = state.get("public_key") or ropts.get("public-key")
+        sid = state.get("short_id") if state.get("short_id") is not None else ropts.get("short-id", "")
+        if not isinstance(uuid, str) or not uuid.strip():
+            raise SystemExit("private vless spec is missing uuid")
+        if not isinstance(servername, str) or not servername.strip():
+            raise SystemExit("private vless spec is missing servername/sni")
+        if not isinstance(pub, str) or not pub.strip():
+            raise SystemExit("private vless spec is missing Reality public_key")
+        if not isinstance(sid, str) or len(sid) > 16 or not re.fullmatch(r"[0-9a-fA-F]*", sid):
+            raise SystemExit("private vless spec short_id must be 0..16 hex characters")
+        fp_client = state.get("client_fingerprint") or state.get("client-fingerprint") or "chrome"
+        flow = state.get("flow", "xtls-rprx-vision")
+        node = common | {
+            "type": "vless",
+            "uuid": uuid.strip(),
+            "network": "tcp",
+            "tls": True,
+            "udp": True,
+            "flow": flow,
+            "servername": servername.strip(),
+            "reality-opts": {
+                "public-key": pub.strip(),
+                "short-id": sid.lower(),
+            },
+            "client-fingerprint": str(fp_client).strip(),
+        }
+        return node
     if kind not in ("socks5", "http"):
-        raise SystemExit("private proxy spec kind must be ss, hysteria2, socks5, or http")
+        raise SystemExit("private proxy spec kind must be ss, hysteria2, vless, socks5, or http")
     for key in ("username", "password"):
         if key not in state:
             raise SystemExit(f"private proxy spec is missing {key}")
@@ -180,29 +211,80 @@ def proxy_node(state: dict, name: str) -> dict:
                      "udp": bool(state.get("udp", False)) if kind == "socks5" else False}
 
 
-def outbound_nodes_and_groups(state: dict, name: str, fallback_state: dict | None = None,
-                              *, require_udp: bool = False) -> tuple[list[dict], list[dict]]:
+def effective_exit_host(state: dict) -> str:
+    raw = state.get("exit_server") or state.get("server") or ""
+    return str(raw).strip().lower().rstrip(".")
+
+
+def outbound_nodes_and_groups(
+    state: dict,
+    name: str,
+    fallback_state: dict | list[dict] | tuple[dict, ...] | None = None,
+    *,
+    require_udp: bool = False,
+    auto_failover: bool = False,
+    fast_desktop: bool = False,
+) -> tuple[list[dict], list[dict]]:
     node_name = name + "·节点"
     node = proxy_node(state, node_name)
     if require_udp and not node.get("udp"):
         raise SystemExit("mobile-global requires an outbound with confirmed UDP support")
     if fallback_state is None:
+        fallbacks: list[dict] = []
+    elif isinstance(fallback_state, dict):
+        fallbacks = [fallback_state]
+    else:
+        fallbacks = list(fallback_state)
+    if not fallbacks:
         return [node], [{"name": name, "type": "select", "proxies": [node_name]}]
-    primary_host = str(state.get("server", "")).strip().lower()
-    fallback_host = str(fallback_state.get("server", "")).strip().lower()
-    if not primary_host or primary_host != fallback_host:
-        raise SystemExit("fallback outbound must use the exact same server host/IP as the primary outbound")
-    if (state.get("kind", "ss"), state.get("port")) == (fallback_state.get("kind", "ss"), fallback_state.get("port")):
-        raise SystemExit("fallback outbound must differ in protocol or port from the primary outbound")
-    fb_name = name + "·备用"
-    fb_node = proxy_node(fallback_state, fb_name)
-    if require_udp and not fb_node.get("udp"):
-        raise SystemExit("mobile-global fallback outbound also requires confirmed UDP support")
-    return [node, fb_node], [{"name": name, "type": "select", "proxies": [node_name, fb_name]}]
+    primary_exit = effective_exit_host(state)
+    if not primary_exit:
+        raise SystemExit("primary outbound is missing server/exit_server")
+    seen_endpoints = {(str(state.get("server", "")).strip().lower(), state.get("kind", "ss"), state.get("port"))}
+    nodes = [node]
+    node_names = [node_name]
+    for idx, fb in enumerate(fallbacks, start=1):
+        fb_exit = effective_exit_host(fb)
+        if not fb_exit or fb_exit != primary_exit:
+            raise SystemExit("fallback outbound must share the exact same final exit host/IP as the primary outbound")
+        endpoint_key = (str(fb.get("server", "")).strip().lower(), fb.get("kind", "ss"), fb.get("port"))
+        if endpoint_key in seen_endpoints:
+            raise SystemExit("fallback outbound must differ in server, protocol, or port from earlier outbounds")
+        seen_endpoints.add(endpoint_key)
+        fb_name = f"{name}·备用" if len(fallbacks) == 1 else f"{name}·备用{idx}"
+        fb_node = proxy_node(fb, fb_name)
+        if require_udp and not fb_node.get("udp"):
+            raise SystemExit("mobile-global fallback outbound also requires confirmed UDP support")
+        nodes.append(fb_node)
+        node_names.append(fb_name)
+    if auto_failover:
+        auto_name = f"🔄 {name}·自动容灾"
+        groups = [
+            {"name": name, "type": "select", "proxies": [auto_name, *node_names]},
+            {
+                "name": auto_name,
+                "type": "fallback",
+                "proxies": list(node_names),
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 30 if fast_desktop else 45,
+                "timeout": 2500,
+                "lazy": not fast_desktop,
+            },
+        ]
+        return nodes, groups
+    return nodes, [{"name": name, "type": "select", "proxies": node_names}]
 
 
-def global_profile(state: dict, name: str, fallback_state: dict | None = None) -> dict:
-    proxies, groups = outbound_nodes_and_groups(state, name, fallback_state, require_udp=True)
+def global_profile(
+    state: dict,
+    name: str,
+    fallback_state: dict | list[dict] | tuple[dict, ...] | None = None,
+    *,
+    auto_failover: bool = False,
+) -> dict:
+    proxies, groups = outbound_nodes_and_groups(
+        state, name, fallback_state, require_udp=True, auto_failover=auto_failover, fast_desktop=False
+    )
     return {
         "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "info", "ipv6": False,
         "unified-delay": True, "tcp-concurrent": True, "keep-alive-idle": 15, "keep-alive-interval": 15,
@@ -270,8 +352,41 @@ def direct_node_state_from_profile(profile: dict, node_name: str, *, allow_hyste
             if isinstance(node.get(bw_key), str) and node[bw_key].strip():
                 extracted[bw_key] = node[bw_key].strip()
         return extracted
+    if ntype == "vless":
+        if not allow_hysteria2:
+            raise SystemExit("VLESS-Reality requires Mihomo (Clash Meta); classic Clash only supports direct Shadowsocks here")
+        supported = {
+            "name", "type", "server", "port", "uuid", "network", "tls", "udp",
+            "flow", "servername", "reality-opts", "client-fingerprint",
+        }
+        unsupported = set(node) - supported
+        if unsupported:
+            raise SystemExit("the selected node has unsupported dependencies or transport fields: "
+                             + ", ".join(sorted(unsupported)))
+        ropts = node.get("reality-opts")
+        pub = ropts.get("public-key") if isinstance(ropts, dict) else None
+        sid = ropts.get("short-id", "") if isinstance(ropts, dict) else None
+        if (not isinstance(node.get("server"), str) or not node["server"].strip()
+                or type(node.get("port")) is not int or not 1 <= node["port"] <= 65535
+                or not isinstance(node.get("uuid"), str) or not node["uuid"].strip()
+                or not isinstance(node.get("servername"), str) or not node["servername"].strip()
+                or node.get("tls") is not True or node.get("udp") is False
+                or not isinstance(pub, str) or not pub.strip()
+                or not isinstance(sid, str) or len(sid) > 16 or not re.fullmatch(r"[0-9a-fA-F]*", sid)):
+            raise SystemExit("the selected VLESS-Reality node requires server, port, uuid, servername, tls=true, and reality-opts (public-key, hex short-id)")
+        return {
+            "kind": "vless",
+            "server": node["server"],
+            "port": node["port"],
+            "uuid": node["uuid"].strip(),
+            "servername": node["servername"].strip(),
+            "public_key": pub.strip(),
+            "short_id": sid.lower(),
+            "flow": node.get("flow", "xtls-rprx-vision"),
+            "client_fingerprint": node.get("client-fingerprint", "chrome"),
+        }
     if ntype != "ss":
-        raise SystemExit("--only-node supports a direct Shadowsocks or Mihomo Hysteria2 node")
+        raise SystemExit("--only-node supports a direct Shadowsocks, Mihomo Hysteria2, or Mihomo VLESS-Reality node")
     supported = {"name", "type", "server", "port", "cipher", "password", "udp"}
     unsupported = set(node) - supported
     if unsupported:
@@ -652,8 +767,16 @@ def apply_x_priority(profile: dict, outbound: str, prioritize_dns: bool = False)
     return apply_domain_priority(profile, outbound, X_DOMAINS, prioritize_dns)
 
 
-def desktop_profile(state: dict, name: str, domains: list[str], base: Path | None,
-                    base_default: str | None, fallback_state: dict | None = None) -> dict:
+def desktop_profile(
+    state: dict,
+    name: str,
+    domains: list[str],
+    base: Path | None,
+    base_default: str | None,
+    fallback_state: dict | list[dict] | tuple[dict, ...] | None = None,
+    *,
+    auto_failover: bool = False,
+) -> dict:
     if base and yaml is None:
         raise SystemExit("PyYAML is required when an existing desktop profile is supplied")
     data = (yaml.safe_load(base.read_bytes()) or {}) if base else {
@@ -667,7 +790,9 @@ def desktop_profile(state: dict, name: str, domains: list[str], base: Path | Non
     proxies = data.setdefault("proxies", [])
     groups = data.setdefault("proxy-groups", [])
     rules = data.setdefault("rules", [])
-    new_nodes, new_groups = outbound_nodes_and_groups(state, name, fallback_state, require_udp=False)
+    new_nodes, new_groups = outbound_nodes_and_groups(
+        state, name, fallback_state, require_udp=False, auto_failover=auto_failover, fast_desktop=True
+    )
     reserved_names = {item["name"] for item in new_nodes + new_groups}
     if any(x.get("name") in reserved_names for x in proxies + groups):
         raise SystemExit("base profile already uses generated names")
@@ -691,14 +816,17 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--state", type=Path,
                    help="mode-600 deployment state or private proxy spec JSON")
-    p.add_argument("--fallback-state", type=Path,
-                   help="optional mode-600 companion state on the same server for 1-tap manual switch in the select group (for example ss 28447 alongside hysteria2 28448)")
+    p.add_argument("--fallback-state", type=Path, action="append", default=[],
+                   help="optional mode-600 companion or server-locked relay state sharing the same final exit IP (repeatable in priority order)")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
     p.add_argument("--base", type=Path, help="existing YAML used only by the selected mode")
-    p.add_argument("--only-node", help="exact direct Shadowsocks or Hysteria2 node to extract from --base")
-    p.add_argument("--fallback-node", help="optional companion direct node on the same server for 1-tap manual switch with --only-node")
+    p.add_argument("--only-node", help="exact direct Shadowsocks, Hysteria2, or VLESS-Reality node to extract from --base")
+    p.add_argument("--fallback-node", action="append", default=[],
+                   help="optional companion node on the same server to extract from --base with --only-node (repeatable)")
+    p.add_argument("--auto-failover", action="store_true",
+                   help="wrap the primary and same-exit fallback/relay nodes in a fast fail-closed Mihomo fallback group")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")
@@ -722,19 +850,21 @@ def main() -> None:
         p.error("--cn-cidrs requires Mihomo --mode mobile-cn-split without --classic-android")
     if args.block_quic is not None and (args.mode != "mobile-cn-split" or args.classic_android):
         p.error("--block-quic / --no-block-quic requires Mihomo --mode mobile-cn-split without --classic-android")
-    if args.classic_android and (args.hy2_ports is not None or args.hop_interval is not None):
-        p.error("--hy2-ports and --hop-interval require Mihomo without --classic-android")
+    if args.classic_android and (args.hy2_ports is not None or args.hop_interval is not None or args.auto_failover):
+        p.error("--hy2-ports, --hop-interval, and --auto-failover require Mihomo without --classic-android")
     if (args.hy2_ports is not None or args.hop_interval is not None) and args.only_node is None and not args.state:
         p.error("--hy2-ports and --hop-interval require --state or --only-node")
-    if args.fallback_node is not None and (not args.fallback_node.strip() or args.only_node is None):
+    if args.fallback_node and (any(not n.strip() for n in args.fallback_node) or args.only_node is None):
         p.error("--fallback-node requires --only-node and --base")
-    if args.fallback_state is not None and (not args.state or args.only_node is not None or args.mode == "existing-rules"):
+    if args.fallback_state and (not args.state or args.only_node is not None or args.mode == "existing-rules"):
         p.error("--fallback-state requires --state without --only-node or existing-rules")
+    if args.auto_failover and not (args.fallback_state or args.fallback_node):
+        p.error("--auto-failover requires at least one --fallback-state or --fallback-node")
     if args.only_node is not None and (not args.only_node.strip() or args.mode not in ("mobile-cn-split", "mobile-global")
                            or not args.base or args.state or args.base_default):
         p.error("--only-node needs --base with mobile-cn-split or mobile-global, without --state")
     if any(path and args.output.resolve() == path.resolve()
-           for path in (args.state, args.fallback_state, args.base, args.classic_rules_from, args.cn_cidrs)):
+           for path in (args.state, *args.fallback_state, args.base, args.classic_rules_from, args.cn_cidrs)):
         p.error("output must differ from the private state and existing base profile")
 
     def apply_cli_hy2_overrides(st: dict) -> dict:
@@ -753,11 +883,11 @@ def main() -> None:
         state = apply_cli_hy2_overrides(direct_node_state_from_profile(
             base_prof, args.only_node, allow_hysteria2=not args.classic_android
         ))
-        fb_state = (
-            direct_node_state_from_profile(base_prof, args.fallback_node, allow_hysteria2=not args.classic_android)
-            if args.fallback_node is not None else None
-        )
-        profile = global_profile(state, args.name, fb_state)
+        fb_states = [
+            direct_node_state_from_profile(base_prof, fb_n, allow_hysteria2=not args.classic_android)
+            for fb_n in args.fallback_node
+        ] or None
+        profile = global_profile(state, args.name, fb_states, auto_failover=args.auto_failover)
         if args.mode == "mobile-cn-split":
             profile = mainland_split(profile, args.name, args.classic_android,
                                      args.classic_rules_from, args.cn_cidrs, args.block_quic)
@@ -783,17 +913,20 @@ def main() -> None:
         if not args.state:
             p.error("--state is required for a new profile")
         state = apply_cli_hy2_overrides(private_state(args.state))
-        fb_state = private_state(args.fallback_state) if args.fallback_state else None
-        if args.classic_android and (state.get("kind") == "hysteria2" or (fb_state and fb_state.get("kind") == "hysteria2")):
-            p.error("Hysteria2 requires Mihomo (Clash Meta); omit --classic-android or use a Shadowsocks state")
+        fb_states = [private_state(p_fb) for p_fb in args.fallback_state] or None
+        all_states = [state, *(fb_states or [])]
+        if args.classic_android and any(s.get("kind") in ("hysteria2", "vless") for s in all_states):
+            p.error("Hysteria2 and VLESS-Reality require Mihomo (Clash Meta); omit --classic-android or use a Shadowsocks state")
         if args.mode == "desktop-domains":
             if not (args.domain or args.use_x):
                 p.error("desktop-domains requires --use-x or at least one --domain")
-            profile = desktop_profile(state, args.name, args.domain, args.base, args.base_default, fb_state)
+            profile = desktop_profile(
+                state, args.name, args.domain, args.base, args.base_default, fb_states, auto_failover=args.auto_failover
+            )
         else:
             if args.base:
                 p.error("--base is supported for desktop-domains and mobile-cn-split")
-            profile = global_profile(state, args.name, fb_state)
+            profile = global_profile(state, args.name, fb_states, auto_failover=args.auto_failover)
             if args.mode == "mobile-cn-split":
                 profile = mainland_split(profile, args.name, args.classic_android,
                                          args.classic_rules_from, args.cn_cidrs, args.block_quic)
