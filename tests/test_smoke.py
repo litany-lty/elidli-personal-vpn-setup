@@ -351,9 +351,16 @@ def check_dual_core_generation(directory: Path) -> None:
         rule for rule in mihomo["rules"]
         if rule.startswith(("DOMAIN,", "DOMAIN-SUFFIX,")) and rule.endswith(",DIRECT")
     }
-    assert domain_direct == {
-        f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in ("localhost", "local", "lan", "home.arpa")
-    }
+    assert domain_direct == (
+        {f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in ("localhost", "local", "lan", "home.arpa")}
+        | {f"DOMAIN,{host},DIRECT" for host in (
+            "connect.rom.miui.com",
+            "connectivitycheck.platform.hicloud.com",
+            "wifi.vivo.com.cn",
+            "conn1.oppomobile.com",
+            "conn2.oppomobile.com",
+        )}
+    )
     assert mihomo["rule-providers"] == {
         "cn-ip": {
             "type": "http", "behavior": "ipcidr", "format": "mrs", "interval": 86400,
@@ -362,14 +369,14 @@ def check_dual_core_generation(directory: Path) -> None:
             "path": "./ruleset/personal-vpn/cn-ip.mrs",
         }
     }
-    assert mihomo["dns"]["nameserver"] == [
-        f"https://1.1.1.1/dns-query#{outbound}",
-        f"https://9.9.9.9/dns-query#{outbound}",
-    ]
-    assert all(value.endswith("#DIRECT") for value in mihomo["dns"]["proxy-server-nameserver"])
+    expected_udp_dns = ["223.5.5.5", "119.29.29.29"]
+    assert mihomo["dns"]["default-nameserver"] == expected_udp_dns
+    assert mihomo["dns"]["proxy-server-nameserver"] == expected_udp_dns
+    assert mihomo["dns"]["direct-nameserver"] == expected_udp_dns
+    assert mihomo["dns"]["nameserver"] == expected_udp_dns
     foreign_policy_keys = {"+.service.example.cn"}
     assert all(f"+.{domain}" not in mihomo["dns"]["nameserver-policy"] for domain in X_DOMAINS)
-    assert all(isinstance(value, str) and value.endswith("#DIRECT")
+    assert all(value == expected_udp_dns
                for key, value in mihomo["dns"]["nameserver-policy"].items()
                if key not in foreign_policy_keys)
     assert "+.cn" in mihomo["dns"]["nameserver-policy"]
@@ -377,6 +384,7 @@ def check_dual_core_generation(directory: Path) -> None:
         mihomo["dns"]["nameserver-policy"][key] == mihomo["dns"]["nameserver"]
         for key in foreign_policy_keys
     )
+    assert "keep-alive-idle" not in classic
     assert TEST_STATE["server"] not in json.dumps({
         "rules": mihomo["rules"], "dns": mihomo["dns"],
         "rule-providers": mihomo["rule-providers"],
@@ -497,8 +505,12 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     outbound = "Personal Hy2 exit"
     hy2_global = module.global_profile(TEST_HY2_STATE, outbound)
     assert hy2_global["tun"]["mtu"] == 1400
+    assert hy2_global["tun"]["stack"] == "gvisor"
+    assert hy2_global["tun"]["strict-route"] is False
     assert hy2_global["find-process-mode"] == "off"
+    assert hy2_global["keep-alive-idle"] == 15
     assert hy2_global["keep-alive-interval"] == 15
+    assert hy2_global["profile"] == {"store-selected": True, "store-fake-ip": False}
     assert hy2_global["unified-delay"] is True and hy2_global["tcp-concurrent"] is True
     node = hy2_global["proxies"][0]
     assert node["type"] == "hysteria2"
@@ -513,19 +525,15 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     assert hy2_mihomo["rules"][1:5] == [f"DOMAIN-SUFFIX,{d},{outbound}" for d in X_DOMAINS]
     assert hy2_mihomo["rules"][-2:] == ["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"]
     assert hy2_mihomo["dns"]["prefer-h3"] is False
-    assert all(v.endswith("#DIRECT") for v in hy2_mihomo["dns"]["direct-nameserver"])
+    assert hy2_mihomo["dns"]["direct-nameserver"] == ["223.5.5.5", "119.29.29.29"]
 
-    # Same-host dual-protocol automatic failover (Hy2 28448 + SS 28447)
+    # Same-host dual-protocol direct manual select (Hy2 28448 + SS 28447, no automatic fallback)
     dual_global = module.global_profile(TEST_HY2_STATE, outbound, TEST_STATE)
     assert [p["name"] for p in dual_global["proxies"]] == [f"{outbound}·节点", f"{outbound}·备用"]
     assert dual_global["proxy-groups"] == [
-        {"name": outbound, "type": "select", "proxies": [f"{outbound}·自动容灾", f"{outbound}·节点", f"{outbound}·备用"]},
-        {
-            "name": f"{outbound}·自动容灾", "type": "fallback",
-            "proxies": [f"{outbound}·节点", f"{outbound}·备用"],
-            "url": "https://www.gstatic.com/generate_204", "interval": 120, "timeout": 3000, "lazy": True,
-        },
+        {"name": outbound, "type": "select", "proxies": [f"{outbound}·节点", f"{outbound}·备用"]},
     ]
+    assert all(g["type"] != "fallback" for g in dual_global["proxy-groups"])
     for bad_fb in (
         TEST_STATE | {"server": "192.0.2.99"},
         TEST_HY2_STATE,
@@ -583,8 +591,10 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
         )
         dual_written = load_yaml_or_json(dual_out)
         assert len(dual_written["proxies"]) == 2
-        assert dual_written["proxy-groups"][0]["proxies"][0] == "个人VPN·固定出口·自动容灾"
-        assert dual_written["proxy-groups"][1]["type"] == "fallback"
+        assert dual_written["proxy-groups"] == [
+            {"name": "个人VPN·固定出口", "type": "select", "proxies": ["个人VPN·固定出口·节点", "个人VPN·固定出口·备用"]}
+        ]
+        assert all(g["type"] != "fallback" for g in dual_written["proxy-groups"])
 
         diff_host_state = directory / "foreign-host-ss.json"
         diff_host_state.write_text(json.dumps(TEST_STATE | {"server": "192.0.2.77"}), encoding="utf-8")
@@ -706,8 +716,15 @@ def check_hysteria2_and_deploy_plan(directory: Path) -> None:
     assert "IP-CIDR,0.0.0.0/8,DIRECT,no-resolve" in hop_prof["rules"]
     for dom in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xiaomixiaoai.com", "+.dpfile.com", "+.bytegoofy.com", "+.larkoffice.com", "+.12306.cn"):
         assert dom in hop_prof["dns"]["nameserver-policy"], f"missing domestic DNS policy for {dom}"
-    for filt in ("+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "captive.apple.com", "stun.*.*"):
+    for filt in (
+        "+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "captive.apple.com", "stun.*.*",
+        "time.android.com", "+.ntp.org.cn", "+.miwifi.com", "*.msftconnecttest.com",
+        "connect.rom.miui.com", "connectivitycheck.platform.hicloud.com",
+        "wifi.vivo.com.cn", "conn1.oppomobile.com", "conn2.oppomobile.com",
+    ):
         assert filt in hop_prof["dns"]["fake-ip-filter"], f"missing fake-ip-filter for {filt}"
+    for conn_dom in ("connect.rom.miui.com", "connectivitycheck.platform.hicloud.com", "wifi.vivo.com.cn", "conn1.oppomobile.com", "conn2.oppomobile.com"):
+        assert f"DOMAIN,{conn_dom},DIRECT" in hop_prof["rules"], f"missing DIRECT connectivity rule for {conn_dom}"
 
     extracted_hop = module.direct_node_state_from_profile(
         {"proxies": [hop_node | {"name": "Hop Hy2"}], "proxy-groups": [], "rules": []},

@@ -19,6 +19,13 @@ except ImportError:  # pragma: no cover
 
 
 LOCAL_DOMAINS = ("localhost", "local", "lan", "home.arpa")
+ANDROID_CONNECTIVITY_DOMAINS = (
+    "connect.rom.miui.com",
+    "connectivitycheck.platform.hicloud.com",
+    "wifi.vivo.com.cn",
+    "conn1.oppomobile.com",
+    "conn2.oppomobile.com",
+)
 LOCAL_V4 = ("0.0.0.0/8", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
             "169.254.0.0/16", "100.64.0.0/10", "224.0.0.0/4", "255.255.255.255/32")
 LOCAL_V6 = ("::1/128", "fc00::/7", "fe80::/10", "ff00::/8")
@@ -48,16 +55,20 @@ DOMESTIC_DNS_SUFFIXES = (
     "zhihu.com", "zhimg.com", "weibo.com", "amap.com", "autonavi.com", "ctrip.com", "qunar.com",
 )
 FAKE_IP_FILTER = (
-    "*.lan", "*.local", "*.arpa", "time.*.com", "time.*.apple.com", "ntp.*.com", "+.pool.ntp.org",
+    "*.lan", "*.local", "*.arpa", "time.*.com", "time.*.apple.com", "time.android.com",
+    "ntp.*.com", "+.pool.ntp.org", "+.ntp.org.cn",
     "stun.*.*", "stun.*.*.*", "captive.apple.com",
-    "localhost.ptlogin2.qq.com", "localhost.sec.qq.com", "*.msftncsi.com", "www.msftconnecttest.com",
+    "localhost.ptlogin2.qq.com", "localhost.sec.qq.com", "*.msftncsi.com",
+    "www.msftconnecttest.com", "*.msftconnecttest.com",
+    "connect.rom.miui.com", "connectivitycheck.platform.hicloud.com",
+    "wifi.vivo.com.cn", "conn1.oppomobile.com", "conn2.oppomobile.com", "+.miwifi.com",
     "+.market.xiaomi.com", "+.tencent-cloud.net", "+.meituan.net", "+.sandai.net", "+.xunlei.com",
 )
 CLASSIC_DOMESTIC_DOH = ("https://223.5.5.5/dns-query", "https://223.6.6.6/dns-query")
-MIHOMO_DOMESTIC_DOH = tuple(f"{server}#DIRECT" for server in CLASSIC_DOMESTIC_DOH)
+MOBILE_DOMESTIC_UDP_DNS = ("223.5.5.5", "119.29.29.29")
 FOREIGN_DNS_TARGETS = ("1.1.1.1:53", "9.9.9.9:53")
 QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
-MIHOMO_TOP_KEYS = ("unified-delay", "tcp-concurrent", "keep-alive-interval", "find-process-mode")
+MIHOMO_TOP_KEYS = ("unified-delay", "tcp-concurrent", "keep-alive-idle", "keep-alive-interval", "find-process-mode")
 
 
 def private_state(path: Path) -> dict:
@@ -187,26 +198,22 @@ def outbound_nodes_and_groups(state: dict, name: str, fallback_state: dict | Non
     fb_node = proxy_node(fallback_state, fb_name)
     if require_udp and not fb_node.get("udp"):
         raise SystemExit("mobile-global fallback outbound also requires confirmed UDP support")
-    auto_name = name + "·自动容灾"
-    groups = [
-        {"name": name, "type": "select", "proxies": [auto_name, node_name, fb_name]},
-        {
-            "name": auto_name, "type": "fallback", "proxies": [node_name, fb_name],
-            "url": "https://www.gstatic.com/generate_204", "interval": 120, "timeout": 3000, "lazy": True,
-        },
-    ]
-    return [node, fb_node], groups
+    return [node, fb_node], [{"name": name, "type": "select", "proxies": [node_name, fb_name]}]
 
 
 def global_profile(state: dict, name: str, fallback_state: dict | None = None) -> dict:
     proxies, groups = outbound_nodes_and_groups(state, name, fallback_state, require_udp=True)
     return {
         "mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "info", "ipv6": False,
-        "unified-delay": True, "tcp-concurrent": True, "keep-alive-interval": 15, "find-process-mode": "off",
-        "tun": {"enable": True, "stack": "mixed", "mtu": 1400, "auto-route": True, "strict-route": True,
+        "unified-delay": True, "tcp-concurrent": True, "keep-alive-idle": 15, "keep-alive-interval": 15,
+        "find-process-mode": "off",
+        "profile": {"store-selected": True, "store-fake-ip": False},
+        "tun": {"enable": True, "stack": "gvisor", "mtu": 1400, "auto-route": True, "strict-route": False,
                 "auto-detect-interface": True, "dns-hijack": ["any:53", "tcp://any:53"]},
         "dns": {"enable": True, "listen": "127.0.0.1:1053", "ipv6": False,
                 "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16", "use-system-hosts": False,
+                "default-nameserver": list(MOBILE_DOMESTIC_UDP_DNS),
+                "proxy-server-nameserver": list(MOBILE_DOMESTIC_UDP_DNS),
                 "nameserver": [f"https://1.1.1.1/dns-query#{name}", f"https://9.9.9.9/dns-query#{name}"]},
         "proxies": proxies,
         "proxy-groups": groups,
@@ -500,6 +507,7 @@ def fresh_dns(profile: dict) -> dict:
         "fake-ip-filter": list(FAKE_IP_FILTER),
         "use-system-hosts": False,
         "use-hosts": bool(profile.get("hosts")),
+        "default-nameserver": list(MOBILE_DOMESTIC_UDP_DNS),
     }
     if ipv6 and isinstance(current.get("fake-ip-range6"), str):
         rebuilt["fake-ip-range6"] = current["fake-ip-range6"]
@@ -517,6 +525,7 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False,
     profile["mode"] = "rule"
     profile["rules"] = [
         *(f"DOMAIN-SUFFIX,{suffix},DIRECT" for suffix in LOCAL_DOMAINS),
+        *(f"DOMAIN,{host},DIRECT" for host in ANDROID_CONNECTIVITY_DOMAINS),
         *(f"IP-CIDR,{cidr},DIRECT,no-resolve" for cidr in LOCAL_V4),
         *(f"IP-CIDR6,{cidr},DIRECT,no-resolve" for cidr in LOCAL_V6),
     ]
@@ -572,13 +581,13 @@ def mainland_split(profile: dict, outbound: str, classic: bool = False,
         profile["rules"].append(QUIC_REJECT_RULE)
     profile["rules"].extend(["RULE-SET,cn-ip,DIRECT", f"MATCH,{outbound}"])
     dns["prefer-h3"] = False
-    dns["proxy-server-nameserver"] = list(MIHOMO_DOMESTIC_DOH)
-    dns["direct-nameserver"] = list(MIHOMO_DOMESTIC_DOH)
+    dns["proxy-server-nameserver"] = list(MOBILE_DOMESTIC_UDP_DNS)
+    dns["direct-nameserver"] = list(MOBILE_DOMESTIC_UDP_DNS)
     dns["nameserver-policy"] = {
-        f"+.{suffix}": MIHOMO_DOMESTIC_DOH[index % len(MIHOMO_DOMESTIC_DOH)]
-        for index, suffix in enumerate(DOMESTIC_DNS_SUFFIXES)
+        f"+.{suffix}": list(MOBILE_DOMESTIC_UDP_DNS)
+        for suffix in DOMESTIC_DNS_SUFFIXES
     }
-    dns["nameserver"] = [f"https://1.1.1.1/dns-query#{outbound}", f"https://9.9.9.9/dns-query#{outbound}"]
+    dns["nameserver"] = list(MOBILE_DOMESTIC_UDP_DNS)
     return profile
 
 
@@ -683,13 +692,13 @@ def main() -> None:
     p.add_argument("--state", type=Path,
                    help="mode-600 deployment state or private proxy spec JSON")
     p.add_argument("--fallback-state", type=Path,
-                   help="optional mode-600 companion state on the same server (for example ss 28447 behind hysteria2 28448)")
+                   help="optional mode-600 companion state on the same server for 1-tap manual switch in the select group (for example ss 28447 alongside hysteria2 28448)")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--mode", choices=("mobile-cn-split", "mobile-global", "desktop-domains", "existing-rules"), required=True)
     p.add_argument("--name", default="个人VPN·固定出口")
     p.add_argument("--base", type=Path, help="existing YAML used only by the selected mode")
     p.add_argument("--only-node", help="exact direct Shadowsocks or Hysteria2 node to extract from --base")
-    p.add_argument("--fallback-node", help="optional companion direct node on the same server to extract from --base with --only-node")
+    p.add_argument("--fallback-node", help="optional companion direct node on the same server for 1-tap manual switch with --only-node")
     p.add_argument("--base-default", help="actual selected proxy/group when base mode is global")
     p.add_argument("--domain", action="append", default=[], help="an explicitly requested service domain suffix; repeat for dedicated asset domains")
     p.add_argument("--use-x", action="store_true", help="prioritize X/Twitter and its media for this device")

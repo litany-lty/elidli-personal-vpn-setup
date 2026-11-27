@@ -13,14 +13,14 @@
 如已安装 Git，可在项目根目录直接安装当前发布版本。在本机新建技能目录后，执行：
 
 ```sh
-git clone --depth 1 --branch v1.5.4 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
+git clone --depth 1 --branch v1.5.5 https://github.com/litany-lty/elidli-personal-vpn-setup.git .agents/skills/elidli-personal-vpn-setup
 ```
 
 从旧版升级时，将名称为 `personal-vpn-setup` 的旧 Skill 目录移出 Codex 扫描路径，避免出现两个入口。既有服务器服务名和密钥状态目录沿用原有位置。
 
 如果某台设备要用 X（Twitter），直接告诉助手，例如「手机刷 X 图片和视频，电脑只让 X 走日本」。助手会为相应设备自动把 X 和媒体域名放在国内 IP 判断之前。无需手动维护域名清单。对于点名的其他国外服务，也可参考本机已有分流配置，将站点和专属资源域名一起优先匹配；其余流量沿用已有策略。
 
-手机选择国内外分流时，局域网和大陆公网 IP 直连，其余目的地走所选出口。国内常用域名清单用于选择 DNS。经典 Clash 使用本地 DNS 隧道，Mihomo 使用指定出口的加密 DNS。Mihomo 默认自动更新大陆 IP 规则，也可从可信 CIDR 文本生成单文件配置。
+手机选择国内外分流时，局域网和大陆公网 IP 直连，其余目的地走所选出口。国内常用域名清单用于选择 DNS。经典 Clash 使用本地 DNS 隧道，Mihomo `mobile-cn-split` 采用无状态国内 UDP DNS 与 `fake-ip` 远端代理解析（兼顾手机 Wi-Fi / 蜂窝切网不卡死），支持 `Hy2` 与同 IP `SS` 直接手动切换。Mihomo 默认自动更新大陆 IP 规则，也可从可信 CIDR 文本生成单文件配置。
 
 **只用自己的节点也可以借鉴别人的规则。** 例如「手机国内直连、国外只走自己的日本 VPS。参考 iKuuu 的规则，X 优先」。助手会保留一个自有出口，参考配置仅提供域名分流。若直接从旧手机 YAML 重建，可以用 `--only-node` 指定已确认的自有节点。线路慢时，助手会在这个出口上区分选路等待与视频传输耗时。[单出口示例](references/deployment.md#single-exit-phone)
 
